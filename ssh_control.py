@@ -564,8 +564,12 @@ class RobotYaml:
     @classmethod
     def read_section_block(cls, text, section):
         start, end = cls._section_range(text, section)
-        lines = text.splitlines()
-        return "\n".join(lines[start:end]).rstrip("\n") + "\n"
+        lines = text.splitlines()[start:end]
+        while lines and (
+            not lines[-1].strip() or lines[-1].lstrip().startswith("#")
+        ):
+            lines.pop()
+        return "\n".join(lines).rstrip("\n") + "\n"
 
     @classmethod
     def replace_section_block(cls, text, section, new_block):
@@ -1403,10 +1407,19 @@ class SshControlApp:
         text_widget.configure(state="normal")
         text_widget.delete("1.0", "end")
         text_widget.insert("1.0", block.rstrip("\n"))
+        text_widget.bind("<Control-a>", self._select_all_text)
+        text_widget.bind("<Control-Key-a>", self._select_all_text)
+        text_widget.focus_set()
         line_count = int(text_widget.index("end-1c").split(".")[0])
         height = min(900, max(600, 150 + line_count * 18))
         data["window"].geometry(f"900x{height}")
         data["save"].configure(state="normal")
+
+    def _select_all_text(self, event):
+        widget = event.widget
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "1.0")
+        return "break"
 
     def _save_params(self, path):
         data = self.param_windows.get(path)
