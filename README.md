@@ -48,7 +48,7 @@ sudo apt install python3-tk python3-venv
 - “启动”执行 `cd /opt/ac_ws && sudo ./robot_service.sh`
 - “停止”执行 `cd /opt/ac_ws && sudo ./robot_service.sh stop`
 - 命令里包含 `sudo` 时，程序会自动把保存的密码通过 stdin 输入
-- 根据 `robot_service.sh` 里的 `PID_PATH` 自动检测服务是否已启动
+- 检查 `/opt/ac_ws/logs/start_all.pid` 自动检测服务是否已启动
 - 拖入或选择的文件会上传到 `/opt/ac_ws/models/`
 - 可以读取 `/opt/ac_ws/config/robot.yaml` 中 `first_model_config` 和
   `second_model_config` 下的 `name`，修改后保存，注释会保留

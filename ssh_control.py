@@ -40,8 +40,7 @@ APP_TITLE = "SSH 远程控制"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ssh_control.json")
 DEFAULT_HOST = "192.168.44.100"
 REMOTE_CONFIG_PATH = "/opt/ac_ws/config/robot.yaml"
-ROBOT_SCRIPT_PATH = "/opt/ac_ws/robot_service.sh"
-DEFAULT_PID_PATH = "/opt/ac_ws/robot.pid"
+DEFAULT_PID_PATH = "/opt/ac_ws/logs/start_all.pid"
 
 COLORS = {
     "bg": "#0f131b",
@@ -285,26 +284,7 @@ class SshManager:
                     password,
                 )
 
-    def check_service_status(
-        self,
-        settings,
-        script_path=ROBOT_SCRIPT_PATH,
-        default_pid_path=DEFAULT_PID_PATH,
-    ):
-        script = ""
-        try:
-            script = self.read_remote_text(settings, script_path)
-        except (PermissionError, OSError):
-            script = ""
-        pid_path = default_pid_path
-        if script:
-            match = re.search(
-                r"^\s*PID_PATH\s*=\s*['\"]?([^'\"]+)['\"]?",
-                script,
-                re.MULTILINE,
-            )
-            if match:
-                pid_path = match.group(1).strip()
+    def check_service_status(self, settings, pid_path=DEFAULT_PID_PATH):
         command = (
             "if [ -f " + shlex.quote(pid_path) + " ]; then "
             "while read pid; do "
