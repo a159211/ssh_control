@@ -52,6 +52,7 @@ sudo apt install python3-tk python3-venv
 - 拖入或选择的文件会上传到 `/opt/ac_ws/models/`
 - 可以读取 `/opt/ac_ws/config/robot.yaml` 中 `robot`、`run_gait`、
   `camera_perceptied` 下的 4 个模型 `name`，修改后保存，注释会保留
+- 每个配置 name 后面有“参数”按钮，可弹窗编辑该配置节下的所有参数并保存
 - 勾选“记住密码”后，密码会保存在 `~/.ssh_control.json`，该文件权限为 600
 - 连接日志和命令输出显示在下方日志区
 

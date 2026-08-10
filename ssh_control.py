@@ -41,6 +41,12 @@ CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ssh_control.json")
 DEFAULT_HOST = "192.168.44.100"
 REMOTE_CONFIG_PATH = "/opt/ac_ws/config/robot.yaml"
 DEFAULT_PID_PATH = "/opt/ac_ws/logs/start_all.pid"
+MODEL_PATH_LABELS = {
+    ("robot", "first_model_config"): "robot / first",
+    ("robot", "second_model_config"): "robot / second",
+    ("run_gait", "first_model_config"): "run_gait / first",
+    ("camera_perceptied", "first_model_config"): "camera / first",
+}
 
 COLORS = {
     "bg": "#0f131b",
@@ -384,6 +390,125 @@ class RobotYaml:
         return result
 
     @classmethod
+    def read_section_params(cls, text, section):
+        if isinstance(section, str):
+            section = tuple(section.split(".", 1))
+        target_top, target_sub = section
+        params = {}
+        top = None
+        top_indent = -1
+        sub = None
+        sub_indent = -1
+        for raw_line in text.splitlines():
+            stripped = raw_line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(stripped)
+            key = cls._key_name(stripped)
+            if key in cls.TOP_SECTIONS:
+                top = key
+                top_indent = indent
+                sub = None
+                continue
+            if top is None:
+                continue
+            if indent <= top_indent:
+                if key in cls.TOP_SECTIONS:
+                    top = key
+                    top_indent = indent
+                    sub = None
+                else:
+                    top = None
+                    sub = None
+                continue
+            if key in cls.SUB_SECTIONS:
+                sub = key
+                sub_indent = indent
+                continue
+            if sub is None:
+                continue
+            if indent <= sub_indent:
+                sub = None
+                continue
+            if top == target_top and sub == target_sub:
+                match = re.match(r"^([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$", stripped)
+                if match:
+                    param_key = match.group(1)
+                    value_text = re.split(
+                        r"\s+#", match.group(2).strip(), maxsplit=1
+                    )[0].strip()
+                    params[param_key] = cls._unquote(value_text)
+        return params
+
+    @classmethod
+    def update_section_params(cls, text, section, params):
+        if isinstance(section, str):
+            section = tuple(section.split(".", 1))
+        target_top, target_sub = section
+        lines = text.splitlines()
+        top = None
+        top_indent = -1
+        sub = None
+        sub_indent = -1
+        changed = set()
+        for index, raw_line in enumerate(lines):
+            stripped = raw_line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(stripped)
+            key = cls._key_name(stripped)
+            if key in cls.TOP_SECTIONS:
+                top = key
+                top_indent = indent
+                sub = None
+                continue
+            if top is None:
+                continue
+            if indent <= top_indent:
+                if key in cls.TOP_SECTIONS:
+                    top = key
+                    top_indent = indent
+                    sub = None
+                else:
+                    top = None
+                    sub = None
+                continue
+            if key in cls.SUB_SECTIONS:
+                sub = key
+                sub_indent = indent
+                continue
+            if sub is None:
+                continue
+            if indent <= sub_indent:
+                sub = None
+                continue
+            if top == target_top and sub == target_sub:
+                match = re.match(r"^([A-Za-z0-9_]+)\s*:\s*(.*)$", stripped)
+                if match and match.group(1) in params:
+                    param_key = match.group(1)
+                    value_text = match.group(2).strip()
+                    quote = ""
+                    if value_text and value_text[0] in ("'", '"'):
+                        quote = value_text[0]
+                    comment = ""
+                    comment_match = re.search(r"(\s+#.*)$", value_text)
+                    if comment_match:
+                        comment = comment_match.group(1)
+                    prefix = raw_line[: len(raw_line) - len(stripped)]
+                    lines[index] = (
+                        f"{prefix}{param_key}: "
+                        f"{cls._quote(params[param_key], quote)}{comment}"
+                    )
+                    changed.add(param_key)
+        missing = set(params) - changed
+        if missing:
+            raise ValueError(
+                f"在 {'.'.join(section)} 下没有找到参数："
+                f"{', '.join(sorted(missing))}"
+            )
+        return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+    @classmethod
     def update_name(cls, text, section, new_name):
         if isinstance(section, str):
             section = tuple(section.split(".", 1))
@@ -458,6 +583,7 @@ class SshControlApp:
         self.show_password = False
         self.service_status_checked = False
         self.service_running = None
+        self.param_windows = {}
         self.check_stop = threading.Event()
         self.message_queue = queue.Queue()
 
@@ -536,6 +662,7 @@ class SshControlApp:
         self.model_vars = {
             path: tk.StringVar() for path in RobotYaml.PATHS
         }
+        self.param_buttons = {}
         self.service_status_var = tk.StringVar(value="未检测")
         self.status_var = tk.StringVar(value="等待配置")
         self.last_check_var = tk.StringVar(value="")
@@ -769,15 +896,18 @@ class SshControlApp:
         grid = tk.Frame(inner, bg=COLORS["panel"])
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(1, weight=1)
-        labels = {
-            ("robot", "first_model_config"): "robot / first",
-            ("robot", "second_model_config"): "robot / second",
-            ("run_gait", "first_model_config"): "run_gait / first",
-            ("camera_perceptied", "first_model_config"): "camera / first",
-        }
         for row, path in enumerate(RobotYaml.PATHS):
-            self._grid_label(grid, labels[path], row, 0)
+            self._grid_label(grid, MODEL_PATH_LABELS[path], row, 0)
             self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
+            self.param_buttons[path] = tk.Button(
+                grid, text="参数", command=lambda p=path: self._open_params(p),
+                bg=COLORS["panel2"], fg=COLORS["fg"],
+                activebackground=COLORS["border"], activeforeground=COLORS["fg"],
+                relief="flat", padx=8, pady=2,
+            )
+            self.param_buttons[path].grid(
+                row=row, column=2, padx=(8, 0), pady=4
+            )
 
         config_buttons = tk.Frame(inner, bg=COLORS["panel"])
         config_buttons.pack(fill="x", pady=(8, 0))
@@ -954,15 +1084,18 @@ class SshControlApp:
         grid = tk.Frame(inner, bg=COLORS["panel"])
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(1, weight=1)
-        labels = {
-            ("robot", "first_model_config"): "robot / first",
-            ("robot", "second_model_config"): "robot / second",
-            ("run_gait", "first_model_config"): "run_gait / first",
-            ("camera_perceptied", "first_model_config"): "camera / first",
-        }
         for row, path in enumerate(RobotYaml.PATHS):
-            self._grid_label(grid, labels[path], row, 0)
+            self._grid_label(grid, MODEL_PATH_LABELS[path], row, 0)
             self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
+            self.param_buttons[path] = tk.Button(
+                grid, text="参数", command=lambda p=path: self._open_params(p),
+                bg=COLORS["panel2"], fg=COLORS["fg"],
+                activebackground=COLORS["border"], activeforeground=COLORS["fg"],
+                relief="flat", padx=8, pady=2,
+            )
+            self.param_buttons[path].grid(
+                row=row, column=2, padx=(8, 0), pady=4
+            )
 
         buttons = tk.Frame(inner, bg=COLORS["panel"])
         buttons.pack(fill="x", pady=(8, 0))
@@ -1106,6 +1239,155 @@ class SshControlApp:
             self._post_log(f"保存配置失败：{exc}", "bad")
         finally:
             self.message_queue.put(("busy", False))
+
+    def _open_params(self, path):
+        if self.command_busy:
+            return
+        try:
+            settings = self._settings()
+        except ValueError as exc:
+            self._set_status("bad", "配置无效", str(exc))
+            return
+        if path in self.param_windows:
+            self.param_windows[path]["window"].lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"参数 - {MODEL_PATH_LABELS[path]}")
+        win.configure(bg=COLORS["bg"])
+        win.geometry("560x540")
+        win.transient(self.root)
+        win.grab_set()
+
+        frame = tk.Frame(win, bg=COLORS["bg"], padx=14, pady=12)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame, text=f"正在读取 {MODEL_PATH_LABELS[path]} 参数...",
+            bg=COLORS["bg"], fg=COLORS["muted"],
+            font=(self.font_family, 10),
+        ).pack(anchor="w")
+        body = tk.Frame(frame, bg=COLORS["bg"])
+        body.pack(fill="both", expand=True, pady=(10, 0))
+
+        buttons = tk.Frame(frame, bg=COLORS["bg"])
+        buttons.pack(fill="x", pady=(12, 0))
+        save_button = tk.Button(
+            buttons, text="保存", state="disabled",
+            command=lambda: self._save_params(path),
+            bg=COLORS["accent_dim"], fg="#06120b",
+            activebackground=COLORS["accent"], activeforeground="#06120b",
+            disabledforeground="#5c6f62", relief="flat",
+            padx=14, pady=4, font=(self.font_family, 10, "bold"),
+        )
+        save_button.pack(side="right")
+        tk.Button(
+            buttons, text="取消", command=lambda: self._close_params(path),
+            bg=COLORS["panel2"], fg=COLORS["fg"],
+            activebackground=COLORS["border"], activeforeground=COLORS["fg"],
+            relief="flat", padx=14, pady=4,
+        ).pack(side="right", padx=(10, 0))
+
+        self.param_windows[path] = {
+            "window": win,
+            "body": body,
+            "entries": {},
+            "save": save_button,
+            "settings": settings,
+        }
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_params(path))
+        self._set_command_busy(True)
+        threading.Thread(
+            target=self._load_params_worker, args=(settings, path), daemon=True
+        ).start()
+
+    def _load_params_worker(self, settings, path):
+        try:
+            text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
+            params = RobotYaml.read_section_params(text, path)
+            self.message_queue.put(("params_loaded", path, params))
+        except paramiko.AuthenticationException:
+            self.message_queue.put(
+                ("params_error", path, "认证失败，请检查用户名、密码或私钥")
+            )
+        except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
+            self.message_queue.put(
+                ("params_error", path, str(exc).strip() or type(exc).__name__)
+            )
+        except ValueError as exc:
+            self.message_queue.put(("params_error", path, str(exc)))
+
+    def _populate_params(self, path, params):
+        data = self.param_windows.get(path)
+        if not data:
+            return
+        body = data["body"]
+        for child in body.winfo_children():
+            child.destroy()
+        entries = {}
+        if not params:
+            tk.Label(
+                body, text="没有找到可编辑的参数", bg=COLORS["bg"],
+                fg=COLORS["muted"], font=(self.font_family, 10),
+            ).pack(anchor="w")
+        else:
+            body.columnconfigure(1, weight=1)
+            for row, key in enumerate(sorted(params)):
+                tk.Label(
+                    body, text=key, bg=COLORS["bg"], fg=COLORS["muted"],
+                    font=(self.font_family, 10),
+                ).grid(row=row, column=0, sticky="w", pady=3)
+                var = tk.StringVar(value=params[key])
+                tk.Entry(
+                    body, textvariable=var, bg=COLORS["panel2"],
+                    fg=COLORS["fg"], insertbackground=COLORS["fg"],
+                    relief="flat", bd=0, highlightthickness=1,
+                    highlightbackground=COLORS["border"],
+                    highlightcolor=COLORS["accent"],
+                ).grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=3)
+                entries[key] = var
+        data["entries"] = entries
+        data["save"].configure(state="normal" if params else "disabled")
+
+    def _save_params(self, path):
+        data = self.param_windows.get(path)
+        if not data or not data["entries"]:
+            return
+        values = {
+            key: var.get().strip() for key, var in data["entries"].items()
+        }
+        data["save"].configure(state="disabled")
+        threading.Thread(
+            target=self._save_params_worker,
+            args=(data["settings"], path, values),
+            daemon=True,
+        ).start()
+
+    def _save_params_worker(self, settings, path, values):
+        try:
+            text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
+            text = RobotYaml.update_section_params(text, path, values)
+            self.manager.write_remote_text(settings, REMOTE_CONFIG_PATH, text)
+            self.message_queue.put(("params_saved", path))
+        except paramiko.AuthenticationException:
+            self.message_queue.put(
+                ("params_error", path, "认证失败，请检查用户名、密码或私钥")
+            )
+        except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
+            self.message_queue.put(
+                ("params_error", path, str(exc).strip() or type(exc).__name__)
+            )
+        except ValueError as exc:
+            self.message_queue.put(("params_error", path, str(exc)))
+
+    def _close_params(self, path):
+        data = self.param_windows.pop(path, None)
+        if data:
+            try:
+                data["window"].destroy()
+            except tk.TclError:
+                pass
+        if not self.param_windows:
+            self._set_command_busy(False)
 
     def _check_status(self):
         if self.command_busy:
@@ -1390,6 +1672,19 @@ class SshControlApp:
                     )
                 elif kind == "status_refresh":
                     self.root.after(300, self._check_status)
+                elif kind == "params_loaded":
+                    self._populate_params(payload[0], payload[1])
+                elif kind == "params_saved":
+                    path = payload[0]
+                    self._append_log(
+                        f"参数已保存：{MODEL_PATH_LABELS[path]}", "ok"
+                    )
+                    self._close_params(path)
+                    self.root.after(200, self._read_config)
+                elif kind == "params_error":
+                    path, message = payload
+                    self._append_log(f"参数操作失败：{message}", "bad")
+                    self._close_params(path)
         except queue.Empty:
             pass
         if not self.check_stop.is_set():
