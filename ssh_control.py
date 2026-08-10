@@ -1404,11 +1404,20 @@ class SshControlApp:
         if not data:
             return
         text_widget = data["text"]
+        text_widget.param_path = path
+        data["undo_stack"] = []
         text_widget.configure(state="normal")
+        text_widget.configure(undo=False)
         text_widget.delete("1.0", "end")
         text_widget.insert("1.0", block.rstrip("\n"))
         text_widget.bind("<Control-a>", self._select_all_text)
         text_widget.bind("<Control-Key-a>", self._select_all_text)
+        text_widget.bind("<Control-z>", self._undo_text)
+        text_widget.bind("<Control-Key-z>", self._undo_text)
+        text_widget.bind("<Control-v>", self._paste_text)
+        text_widget.bind("<<Paste>>", self._paste_text)
+        text_widget.bind("<KeyPress>", self._before_edit)
+        text_widget.configure(undo=True)
         text_widget.focus_set()
         line_count = int(text_widget.index("end-1c").split(".")[0])
         height = min(900, max(600, 150 + line_count * 18))
@@ -1419,6 +1428,54 @@ class SshControlApp:
         widget = event.widget
         widget.tag_add("sel", "1.0", "end-1c")
         widget.mark_set("insert", "1.0")
+        return "break"
+
+    def _undo_text(self, event):
+        widget = event.widget
+        path = getattr(widget, "param_path", None)
+        data = self.param_windows.get(path) if path else None
+        if data and data["undo_stack"]:
+            previous = data["undo_stack"].pop()
+            widget.delete("1.0", "end")
+            widget.insert("1.0", previous)
+        return "break"
+
+    def _before_edit(self, event):
+        if event.keysym in (
+            "Control_L", "Control_R", "Shift_L", "Shift_R",
+            "Alt_L", "Alt_R", "Caps_Lock", "Escape", "Tab",
+            "Up", "Down", "Left", "Right", "Home", "End",
+            "Prior", "Next",
+        ):
+            return None
+        widget = event.widget
+        path = getattr(widget, "param_path", None)
+        data = self.param_windows.get(path) if path else None
+        if data:
+            current = widget.get("1.0", "end-1c")
+            if not data["undo_stack"] or data["undo_stack"][-1] != current:
+                data["undo_stack"].append(current)
+                if len(data["undo_stack"]) > 50:
+                    data["undo_stack"].pop(0)
+        return None
+
+    def _paste_text(self, event):
+        widget = event.widget
+        try:
+            text = widget.clipboard_get()
+        except tk.TclError:
+            return "break"
+        path = getattr(widget, "param_path", None)
+        data = self.param_windows.get(path) if path else None
+        if data:
+            current = widget.get("1.0", "end-1c")
+            if not data["undo_stack"] or data["undo_stack"][-1] != current:
+                data["undo_stack"].append(current)
+                if len(data["undo_stack"]) > 50:
+                    data["undo_stack"].pop(0)
+        if widget.tag_ranges("sel"):
+            widget.delete("sel.first", "sel.last")
+        widget.insert("insert", text)
         return "break"
 
     def _save_params(self, path):
