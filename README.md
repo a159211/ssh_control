@@ -50,8 +50,8 @@ sudo apt install python3-tk python3-venv
 - 命令里包含 `sudo` 时，程序会自动把保存的密码通过 stdin 输入
 - 检查 `/opt/ac_ws/logs/start_all.pid` 自动检测服务是否已启动
 - 拖入或选择的文件会上传到 `/opt/ac_ws/models/`
-- 可以读取 `/opt/ac_ws/config/robot.yaml` 中 `first_model_config` 和
-  `second_model_config` 下的 `name`，修改后保存，注释会保留
+- 可以读取 `/opt/ac_ws/config/robot.yaml` 中 `robot`、`run_gait`、
+  `camera_perceptied` 下的 4 个模型 `name`，修改后保存，注释会保留
 - 勾选“记住密码”后，密码会保存在 `~/.ssh_control.json`，该文件权限为 600
 - 连接日志和命令输出显示在下方日志区
 

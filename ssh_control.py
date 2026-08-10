@@ -287,11 +287,7 @@ class SshManager:
     def check_service_status(self, settings, pid_path=DEFAULT_PID_PATH):
         command = (
             "if [ -f " + shlex.quote(pid_path) + " ]; then "
-            "while read pid; do "
-            "[ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null "
-            "&& echo RUNNING && exit 0; "
-            "done < " + shlex.quote(pid_path) + "; "
-            "fi; echo STOPPED"
+            "echo RUNNING; else echo STOPPED; fi"
         )
         with self.lock:
             if not self._connected_locked():
@@ -309,7 +305,14 @@ class SshManager:
 
 
 class RobotYaml:
-    SECTIONS = ("first_model_config", "second_model_config")
+    TOP_SECTIONS = ("robot", "run_gait", "camera_perceptied")
+    SUB_SECTIONS = ("first_model_config", "second_model_config")
+    PATHS = (
+        ("robot", "first_model_config"),
+        ("robot", "second_model_config"),
+        ("run_gait", "first_model_config"),
+        ("camera_perceptied", "first_model_config"),
+    )
 
     @staticmethod
     def _key_name(line):
@@ -335,40 +338,63 @@ class RobotYaml:
 
     @classmethod
     def read_names(cls, text):
-        result = {section: None for section in cls.SECTIONS}
-        section = None
-        section_indent = -1
+        result = {".".join(path): None for path in cls.PATHS}
+        top = None
+        top_indent = -1
+        sub = None
+        sub_indent = -1
         for raw_line in text.splitlines():
             stripped = raw_line.lstrip()
             if not stripped or stripped.startswith("#"):
                 continue
             indent = len(raw_line) - len(stripped)
             key = cls._key_name(stripped)
-            if section is None:
-                if key in cls.SECTIONS:
-                    section = key
-                    section_indent = indent
+            if key in cls.TOP_SECTIONS:
+                top = key
+                top_indent = indent
+                sub = None
                 continue
-            if indent <= section_indent:
-                if key in cls.SECTIONS:
-                    section = key
-                    section_indent = indent
+            if top is None:
+                continue
+            if indent <= top_indent:
+                if key in cls.TOP_SECTIONS:
+                    top = key
+                    top_indent = indent
+                    sub = None
                 else:
-                    section = None
+                    top = None
+                    sub = None
                 continue
-            match = re.match(r"^name\s*:\s*(.+?)\s*$", stripped)
-            if match:
-                value_text = re.split(r"\s+#", match.group(1).strip(), maxsplit=1)[0].strip()
-                result[section] = cls._unquote(value_text)
+            if key in cls.SUB_SECTIONS:
+                sub = key
+                sub_indent = indent
+                continue
+            if sub is None:
+                continue
+            if indent <= sub_indent:
+                sub = None
+                continue
+            if key == "name":
+                match = re.match(r"^name\s*:\s*(.+?)\s*$", stripped)
+                if match:
+                    value_text = re.split(
+                        r"\s+#", match.group(1).strip(), maxsplit=1
+                    )[0].strip()
+                    result[f"{top}.{sub}"] = cls._unquote(value_text)
         return result
 
     @classmethod
     def update_name(cls, text, section, new_name):
-        if section not in cls.SECTIONS:
-            raise ValueError(f"未知配置节：{section}")
+        if isinstance(section, str):
+            section = tuple(section.split(".", 1))
+        if section not in cls.PATHS:
+            raise ValueError(f"未知配置节：{'.'.join(section)}")
+        target_top, target_sub = section
         lines = text.splitlines()
-        current_section = None
-        section_indent = -1
+        top = None
+        top_indent = -1
+        sub = None
+        sub_indent = -1
         changed = False
         for index, raw_line in enumerate(lines):
             stripped = raw_line.lstrip()
@@ -376,19 +402,32 @@ class RobotYaml:
                 continue
             indent = len(raw_line) - len(stripped)
             key = cls._key_name(stripped)
-            if current_section is None:
-                if key in cls.SECTIONS:
-                    current_section = key
-                    section_indent = indent
+            if key in cls.TOP_SECTIONS:
+                top = key
+                top_indent = indent
+                sub = None
                 continue
-            if indent <= section_indent:
-                if key in cls.SECTIONS:
-                    current_section = key
-                    section_indent = indent
+            if top is None:
+                continue
+            if indent <= top_indent:
+                if key in cls.TOP_SECTIONS:
+                    top = key
+                    top_indent = indent
+                    sub = None
                 else:
-                    current_section = None
+                    top = None
+                    sub = None
                 continue
-            if current_section == section:
+            if key in cls.SUB_SECTIONS:
+                sub = key
+                sub_indent = indent
+                continue
+            if sub is None:
+                continue
+            if indent <= sub_indent:
+                sub = None
+                continue
+            if top == target_top and sub == target_sub and key == "name":
                 match = re.match(r"^name\s*:\s*(.*)$", stripped)
                 if match:
                     prefix = raw_line[: len(raw_line) - len(stripped)]
@@ -406,7 +445,7 @@ class RobotYaml:
                     changed = True
                     break
         if not changed:
-            raise ValueError(f"在 {section} 下没有找到可修改的 name")
+            raise ValueError(f"在 {'.'.join(section)} 下没有找到可修改的 name")
         return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
@@ -418,6 +457,7 @@ class SshControlApp:
         self.command_busy = False
         self.show_password = False
         self.service_status_checked = False
+        self.service_running = None
         self.check_stop = threading.Event()
         self.message_queue = queue.Queue()
 
@@ -493,8 +533,9 @@ class SshControlApp:
         self.auto_check_var = tk.BooleanVar()
         self.remember_var = tk.BooleanVar()
         self.upload_var = tk.StringVar(value="拖入文件到此处")
-        self.first_model_var = tk.StringVar()
-        self.second_model_var = tk.StringVar()
+        self.model_vars = {
+            path: tk.StringVar() for path in RobotYaml.PATHS
+        }
         self.service_status_var = tk.StringVar(value="未检测")
         self.status_var = tk.StringVar(value="等待配置")
         self.last_check_var = tk.StringVar(value="")
@@ -728,10 +769,15 @@ class SshControlApp:
         grid = tk.Frame(inner, bg=COLORS["panel"])
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(1, weight=1)
-        self._grid_label(grid, "第一个模型 name", 0, 0)
-        self._grid_entry(grid, self.first_model_var, 0, 1, padx=(4, 0))
-        self._grid_label(grid, "第二个模型 name", 1, 0)
-        self._grid_entry(grid, self.second_model_var, 1, 1, padx=(4, 0))
+        labels = {
+            ("robot", "first_model_config"): "robot / first",
+            ("robot", "second_model_config"): "robot / second",
+            ("run_gait", "first_model_config"): "run_gait / first",
+            ("camera_perceptied", "first_model_config"): "camera / first",
+        }
+        for row, path in enumerate(RobotYaml.PATHS):
+            self._grid_label(grid, labels[path], row, 0)
+            self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
 
         config_buttons = tk.Frame(inner, bg=COLORS["panel"])
         config_buttons.pack(fill="x", pady=(8, 0))
@@ -908,10 +954,15 @@ class SshControlApp:
         grid = tk.Frame(inner, bg=COLORS["panel"])
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(1, weight=1)
-        self._grid_label(grid, "第一个模型 name", 0, 0)
-        self._grid_entry(grid, self.first_model_var, 0, 1, padx=(4, 0))
-        self._grid_label(grid, "第二个模型 name", 1, 0)
-        self._grid_entry(grid, self.second_model_var, 1, 1, padx=(4, 0))
+        labels = {
+            ("robot", "first_model_config"): "robot / first",
+            ("robot", "second_model_config"): "robot / second",
+            ("run_gait", "first_model_config"): "run_gait / first",
+            ("camera_perceptied", "first_model_config"): "camera / first",
+        }
+        for row, path in enumerate(RobotYaml.PATHS):
+            self._grid_label(grid, labels[path], row, 0)
+            self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
 
         buttons = tk.Frame(inner, bg=COLORS["panel"])
         buttons.pack(fill="x", pady=(8, 0))
@@ -1001,9 +1052,7 @@ class SshControlApp:
         try:
             text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
             names = RobotYaml.read_names(text)
-            self.message_queue.put(
-                ("config", names["first_model_config"], names["second_model_config"])
-            )
+            self.message_queue.put(("config", names))
             self._post_log("配置读取完成", "ok")
         except paramiko.AuthenticationException:
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
@@ -1020,10 +1069,11 @@ class SshControlApp:
     def _save_config(self):
         if self.command_busy:
             return
-        first = self.first_model_var.get().strip()
-        second = self.second_model_var.get().strip()
-        if not first or not second:
-            self._append_log("请先读取配置并填写两个 name", "bad")
+        values = {
+            path: self.model_vars[path].get().strip() for path in RobotYaml.PATHS
+        }
+        if not all(values.values()):
+            self._append_log("请先读取配置并填写全部 4 个 name", "bad")
             return
         try:
             settings = self._settings()
@@ -1033,16 +1083,16 @@ class SshControlApp:
         self._set_command_busy(True)
         threading.Thread(
             target=self._save_config_worker,
-            args=(settings, first, second),
+            args=(settings, values),
             daemon=True,
         ).start()
 
-    def _save_config_worker(self, settings, first, second):
+    def _save_config_worker(self, settings, values):
         self._post_log(f"正在保存 {REMOTE_CONFIG_PATH}", "muted")
         try:
             text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
-            text = RobotYaml.update_name(text, "first_model_config", first)
-            text = RobotYaml.update_name(text, "second_model_config", second)
+            for path in RobotYaml.PATHS:
+                text = RobotYaml.update_name(text, path, values[path])
             self.manager.write_remote_text(settings, REMOTE_CONFIG_PATH, text)
             self._post_log("配置保存完成", "ok")
         except paramiko.AuthenticationException:
@@ -1230,9 +1280,15 @@ class SshControlApp:
             self.checking = False
 
     def run_start(self):
+        if self.service_running is True:
+            self._append_log("服务已启动，无需再次启动", "bad")
+            return
         self._execute_command("start", self.start_cmd_var.get().strip())
 
     def run_stop(self):
+        if self.service_running is False:
+            self._append_log("服务未启动，无需停止", "bad")
+            return
         self._execute_command("stop", self.stop_cmd_var.get().strip())
 
     def _execute_command(self, kind, command):
@@ -1288,8 +1344,16 @@ class SshControlApp:
         self.status_check_button.configure(state="disabled" if busy else "normal")
 
     def _update_command_buttons(self):
-        start_ready = bool(self.start_cmd_var.get().strip()) and not self.command_busy
-        stop_ready = bool(self.stop_cmd_var.get().strip()) and not self.command_busy
+        start_ready = (
+            bool(self.start_cmd_var.get().strip())
+            and not self.command_busy
+            and self.service_running is False
+        )
+        stop_ready = (
+            bool(self.stop_cmd_var.get().strip())
+            and not self.command_busy
+            and self.service_running is True
+        )
         self.start_button.configure(state="normal" if start_ready else "disabled")
         self.stop_button.configure(state="normal" if stop_ready else "disabled")
 
@@ -1307,14 +1371,19 @@ class SshControlApp:
                 elif kind == "busy":
                     self._set_command_busy(payload[0])
                 elif kind == "config":
-                    self.first_model_var.set(payload[0] or "")
-                    self.second_model_var.set(payload[1] or "")
+                    names = payload[0]
+                    for path in RobotYaml.PATHS:
+                        self.model_vars[path].set(
+                            names.get(".".join(path)) or ""
+                        )
                 elif kind == "service_status":
                     running, pid_path = payload
+                    self.service_running = running
                     self.service_status_var.set("已启动" if running else "未启动")
                     self.service_status_label.configure(
                         fg=COLORS["accent"] if running else COLORS["muted"]
                     )
+                    self._update_command_buttons()
                     self._append_log(
                         f"运行状态：{'已启动' if running else '未启动'}（{pid_path}）",
                         "ok" if running else "muted",
