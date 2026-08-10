@@ -565,7 +565,7 @@ class RobotYaml:
     def read_section_block(cls, text, section):
         start, end = cls._section_range(text, section)
         lines = text.splitlines()
-        return "\n".join(lines[start:end]) + "\n"
+        return "\n".join(lines[start:end]).rstrip("\n") + "\n"
 
     @classmethod
     def replace_section_block(cls, text, section, new_block):
@@ -1331,7 +1331,7 @@ class SshControlApp:
         win = tk.Toplevel(self.root)
         win.title(f"参数 - {MODEL_PATH_LABELS[path]}")
         win.configure(bg=COLORS["bg"])
-        win.geometry("560x540")
+        win.geometry("900x640")
         win.transient(self.root)
         win.grab_set()
 
@@ -1402,7 +1402,10 @@ class SshControlApp:
         text_widget = data["text"]
         text_widget.configure(state="normal")
         text_widget.delete("1.0", "end")
-        text_widget.insert("1.0", block)
+        text_widget.insert("1.0", block.rstrip("\n"))
+        line_count = int(text_widget.index("end-1c").split(".")[0])
+        height = min(900, max(600, 150 + line_count * 18))
+        data["window"].geometry(f"900x{height}")
         data["save"].configure(state="normal")
 
     def _save_params(self, path):
