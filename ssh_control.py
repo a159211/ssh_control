@@ -509,6 +509,82 @@ class RobotYaml:
         return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
     @classmethod
+    def _section_range(cls, text, section):
+        if isinstance(section, str):
+            section = tuple(section.split(".", 1))
+        target_top, target_sub = section
+        lines = text.splitlines()
+        top = None
+        top_indent = -1
+        sub = None
+        sub_indent = -1
+        start = None
+        for index, raw_line in enumerate(lines):
+            stripped = raw_line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(stripped)
+            key = cls._key_name(stripped)
+            if key in cls.TOP_SECTIONS:
+                top = key
+                top_indent = indent
+                sub = None
+                continue
+            if top is None:
+                continue
+            if indent <= top_indent:
+                if key in cls.TOP_SECTIONS:
+                    top = key
+                    top_indent = indent
+                    sub = None
+                else:
+                    top = None
+                    sub = None
+                continue
+            if key in cls.SUB_SECTIONS:
+                sub = key
+                sub_indent = indent
+                if top == target_top and key == target_sub:
+                    start = index
+                    break
+                continue
+        if start is None:
+            raise ValueError(f"在 {'.'.join(section)} 下没有找到配置节")
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            stripped = lines[index].lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(lines[index]) - len(stripped)
+            if indent <= sub_indent:
+                end = index
+                break
+        return start, end
+
+    @classmethod
+    def read_section_block(cls, text, section):
+        start, end = cls._section_range(text, section)
+        lines = text.splitlines()
+        return "\n".join(lines[start:end]) + "\n"
+
+    @classmethod
+    def replace_section_block(cls, text, section, new_block):
+        start, end = cls._section_range(text, section)
+        if not new_block.strip():
+            raise ValueError("替换内容不能为空")
+        lines = text.splitlines()
+        old_block = cls.read_section_block(text, section)
+        first_line = old_block.splitlines()[0]
+        indent = len(first_line) - len(first_line.lstrip())
+        new_lines = []
+        for line in new_block.rstrip("\n").split("\n"):
+            if line.strip() and not line.startswith(" " * indent):
+                line = " " * indent + line
+            new_lines.append(line)
+        lines[start:end] = new_lines
+        return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+    @classmethod
     def update_name(cls, text, section, new_name):
         if isinstance(section, str):
             section = tuple(section.split(".", 1))
@@ -590,7 +666,7 @@ class SshControlApp:
         self.root = TkinterDnD.Tk() if HAS_TKDND else tk.Tk()
         self.root.title(APP_TITLE)
         self.root.configure(bg=COLORS["bg"])
-        self.root.geometry("1180x680")
+        self.root.geometry("1280x820")
         self.root.minsize(1000, 620)
         self._families = set(tkfont.families(self.root))
         self.font_family = self._pick_font(self.config.get("ui_font"))
@@ -1266,7 +1342,11 @@ class SshControlApp:
             bg=COLORS["bg"], fg=COLORS["muted"],
             font=(self.font_family, 10),
         ).pack(anchor="w")
-        body = tk.Frame(frame, bg=COLORS["bg"])
+        body = scrolledtext.ScrolledText(
+            frame, bg=COLORS["bg"], fg=COLORS["fg"],
+            insertbackground=COLORS["fg"], relief="flat", wrap="none",
+            font=(self.number_family, 9), state="disabled",
+        )
         body.pack(fill="both", expand=True, pady=(10, 0))
 
         buttons = tk.Frame(frame, bg=COLORS["bg"])
@@ -1289,8 +1369,7 @@ class SshControlApp:
 
         self.param_windows[path] = {
             "window": win,
-            "body": body,
-            "entries": {},
+            "text": body,
             "save": save_button,
             "settings": settings,
         }
@@ -1303,8 +1382,8 @@ class SshControlApp:
     def _load_params_worker(self, settings, path):
         try:
             text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
-            params = RobotYaml.read_section_params(text, path)
-            self.message_queue.put(("params_loaded", path, params))
+            block = RobotYaml.read_section_block(text, path)
+            self.message_queue.put(("params_loaded", path, block))
         except paramiko.AuthenticationException:
             self.message_queue.put(
                 ("params_error", path, "认证失败，请检查用户名、密码或私钥")
@@ -1316,56 +1395,32 @@ class SshControlApp:
         except ValueError as exc:
             self.message_queue.put(("params_error", path, str(exc)))
 
-    def _populate_params(self, path, params):
+    def _populate_params(self, path, block):
         data = self.param_windows.get(path)
         if not data:
             return
-        body = data["body"]
-        for child in body.winfo_children():
-            child.destroy()
-        entries = {}
-        if not params:
-            tk.Label(
-                body, text="没有找到可编辑的参数", bg=COLORS["bg"],
-                fg=COLORS["muted"], font=(self.font_family, 10),
-            ).pack(anchor="w")
-        else:
-            body.columnconfigure(1, weight=1)
-            for row, key in enumerate(sorted(params)):
-                tk.Label(
-                    body, text=key, bg=COLORS["bg"], fg=COLORS["muted"],
-                    font=(self.font_family, 10),
-                ).grid(row=row, column=0, sticky="w", pady=3)
-                var = tk.StringVar(value=params[key])
-                tk.Entry(
-                    body, textvariable=var, bg=COLORS["panel2"],
-                    fg=COLORS["fg"], insertbackground=COLORS["fg"],
-                    relief="flat", bd=0, highlightthickness=1,
-                    highlightbackground=COLORS["border"],
-                    highlightcolor=COLORS["accent"],
-                ).grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=3)
-                entries[key] = var
-        data["entries"] = entries
-        data["save"].configure(state="normal" if params else "disabled")
+        text_widget = data["text"]
+        text_widget.configure(state="normal")
+        text_widget.delete("1.0", "end")
+        text_widget.insert("1.0", block)
+        data["save"].configure(state="normal")
 
     def _save_params(self, path):
         data = self.param_windows.get(path)
-        if not data or not data["entries"]:
+        if not data:
             return
-        values = {
-            key: var.get().strip() for key, var in data["entries"].items()
-        }
+        new_block = data["text"].get("1.0", "end")
         data["save"].configure(state="disabled")
         threading.Thread(
             target=self._save_params_worker,
-            args=(data["settings"], path, values),
+            args=(data["settings"], path, new_block),
             daemon=True,
         ).start()
 
-    def _save_params_worker(self, settings, path, values):
+    def _save_params_worker(self, settings, path, new_block):
         try:
             text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
-            text = RobotYaml.update_section_params(text, path, values)
+            text = RobotYaml.replace_section_block(text, path, new_block)
             self.manager.write_remote_text(settings, REMOTE_CONFIG_PATH, text)
             self.message_queue.put(("params_saved", path))
         except paramiko.AuthenticationException:
