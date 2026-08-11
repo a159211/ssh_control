@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 from tkinter import font as tkfont
 from tkinter import filedialog, scrolledtext
 
@@ -293,7 +294,11 @@ class SshManager:
     def check_service_status(self, settings, pid_path=DEFAULT_PID_PATH):
         command = (
             "if [ -f " + shlex.quote(pid_path) + " ]; then "
-            "echo RUNNING; else echo STOPPED; fi"
+            "while read pid; do "
+            "[ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null "
+            "&& echo RUNNING && exit 0; "
+            "done < " + shlex.quote(pid_path) + "; "
+            "fi; echo STOPPED"
         )
         with self.lock:
             if not self._connected_locked():
@@ -678,6 +683,7 @@ class SshControlApp:
 
         self._create_vars()
         self._build_ui()
+        self._enable_drop_targets()
         self._apply_config()
         self.auto_check_var.trace_add("write", lambda *_: self._auto_check_toggled())
         self._update_command_buttons()
@@ -1041,6 +1047,10 @@ class SshControlApp:
         self.upload_button.grid(row=0, column=2, padx=(10, 0))
 
         if HAS_TKDND:
+            card.drop_target_register(DND_FILES)
+            card.dnd_bind("<<Drop>>", self._on_file_drop)
+            inner.drop_target_register(DND_FILES)
+            inner.dnd_bind("<<Drop>>", self._on_file_drop)
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_file_drop)
             self.root.drop_target_register(DND_FILES)
@@ -1138,6 +1148,10 @@ class SshControlApp:
         self.upload_button.grid(row=0, column=2, padx=(10, 0))
 
         if HAS_TKDND:
+            card.drop_target_register(DND_FILES)
+            card.dnd_bind("<<Drop>>", self._on_file_drop)
+            inner.drop_target_register(DND_FILES)
+            inner.dnd_bind("<<Drop>>", self._on_file_drop)
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_file_drop)
             self.root.drop_target_register(DND_FILES)
@@ -1194,9 +1208,44 @@ class SshControlApp:
         self.config_save_button.pack(side="right", padx=(10, 0))
 
     def _on_file_drop(self, event):
-        files = self.root.tk.splitlist(event.data)
+        files = self._parse_drop_files(event.data)
         if files:
             self._upload_file(files[0])
+        else:
+            self._append_log("未识别到可上传的文件", "bad")
+
+    def _parse_drop_files(self, data):
+        if not data:
+            return []
+        raw_items = self.root.tk.splitlist(data) if HAS_TKDND else []
+        if not raw_items:
+            raw_items = data.splitlines()
+        files = []
+        for item in raw_items:
+            item = item.strip().strip("{}").strip()
+            if item.startswith("file://"):
+                item = item[len("file://"):]
+                if item.startswith("localhost/"):
+                    item = item[len("localhost/"):]
+            item = urllib.parse.unquote(item)
+            if os.path.isfile(item):
+                files.append(item)
+        return files
+
+    def _enable_drop_targets(self):
+        if not HAS_TKDND:
+            return
+
+        def walk(widget):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_file_drop)
+            except tk.TclError:
+                pass
+            for child in widget.winfo_children():
+                walk(child)
+
+        walk(self.root)
 
     def _choose_file(self):
         path = filedialog.askopenfilename(title="选择要上传的文件")
