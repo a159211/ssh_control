@@ -1688,14 +1688,15 @@ class SshControlApp:
     def _auto_tick(self):
         if self.check_stop.is_set() or not self.auto_check_var.get():
             return
-        try:
-            settings = self._settings()
-        except ValueError as exc:
-            self._set_status("idle", "等待配置", str(exc))
-        else:
-            threading.Thread(
-                target=self._check_worker, args=(settings, False), daemon=True
-            ).start()
+        if not self.command_busy:
+            try:
+                settings = self._settings()
+            except ValueError as exc:
+                self._set_status("idle", "等待配置", str(exc))
+            else:
+                threading.Thread(
+                    target=self._check_worker, args=(settings, False), daemon=True
+                ).start()
         try:
             interval = max(2, int(self.interval_var.get()))
         except ValueError:
