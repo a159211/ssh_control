@@ -295,7 +295,7 @@ class SshManager:
         command = (
             "if [ -f " + shlex.quote(pid_path) + " ]; then "
             "while read pid; do "
-            "[ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null "
+            "[ -n \"$pid\" ] && ps -p \"$pid\" >/dev/null 2>&1 "
             "&& echo RUNNING && exit 0; "
             "done < " + shlex.quote(pid_path) + "; "
             "fi; echo STOPPED"
