@@ -110,6 +110,7 @@ PROFILES = {
                 "name": "相机节点",
                 "script": "bringup2.sh",
                 "detect_keyword": "camera_container",
+                "stop_timeout": 90.0,
             },
         ],
         "show_config": False,
@@ -779,6 +780,7 @@ class SshControlApp:
         if self.auto_check_var.get():
             self.root.after(300, self._auto_tick)
         self.root.after(60, self._poll_messages)
+        self.root.after(600, self._auto_read_config_once)
 
     def _pick_font(self, saved=None):
         if saved and saved != "Helvetica" and saved in self._families:
@@ -1459,6 +1461,15 @@ class SshControlApp:
         threading.Thread(
             target=self._read_config_worker, args=(settings,), daemon=True
         ).start()
+
+    def _auto_read_config_once(self):
+        """程序打开后自动读取一次远端配置；若界面正忙则稍后重试。"""
+        if self.check_stop.is_set():
+            return
+        if self.command_busy:
+            self.root.after(1000, self._auto_read_config_once)
+            return
+        self._read_config()
 
     def _read_config_worker(self, settings):
         self._post_log(f"正在读取 {self.remote_config_path}", "muted")

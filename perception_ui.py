@@ -38,6 +38,9 @@ PANEL_STATUS_COLORS = {
     "check": COLORS["warn"],
 }
 
+# 启动/停止后台确认状态的超时（秒）：超过仍未出结果就显示超时
+PANEL_OP_TIMEOUT = {"start": 30.0, "stop": 40.0}
+
 
 def detect_command(workdir):
     """生成 ros2 node list 检测命令，自动加载 /opt/ros 与工作区环境。"""
@@ -73,14 +76,15 @@ def start_command(workdir, script):
 
 
 def stop_command(workdir, script, keyword=""):
-    """停止命令：三重杀灭并输出诊断信息。
+    """停止命令：静默执行三重杀灭，不输出诊断细节。
 
     1) 按启动时记录的 PID 杀整个进程组（ros2 节点是脚本的子进程，只杀
        脚本自身会留下孤儿节点），TERM 后等 1 秒再 KILL 兜底；
     2) pkill 匹配 "bash <脚本名>"，覆盖 pid 文件缺失/失效的情况；
     3) 按检测关键字 pkill 节点进程（如 depth_image_bridge_node），
        覆盖从旧版本启动、已脱离进程组的孤儿节点。
-    最后清理 pid 文件并列出仍存活的相关进程，方便排查。
+    最后清理 pid 文件。命令本身静默执行，不打印各种 rc/进程列表，
+    停止是否成功由界面后台检测（停止成功/停止超时）来确认。
     pkill 模式用 [b]ring1.sh / [d]epth... 写法，避免匹配到本次 ssh
     命令自身的命令行而误杀。
     """
@@ -88,27 +92,22 @@ def stop_command(workdir, script, keyword=""):
     script_pattern = "bash " + "[" + script[0] + "]" + script[1:]
     parts = [
         "cd " + shlex.quote(workdir),
-        "echo \"== 停止 " + script + " ==\"",
         "pidfile=" + shlex.quote(pid_file),
         "pid=$(cat \"$pidfile\" 2>/dev/null)",
-        "echo \"pid 文件内容: ${pid:-无}\"",
         "if [ -n \"$pid\" ]; then "
-        + "kill -TERM -\"$pid\" 2>&1; echo \"进程组 TERM rc=$?\"; "
-        + "sleep 1; "
-        + "kill -KILL -\"$pid\" 2>&1; echo \"进程组 KILL rc=$?\"; "
+        + "kill -TERM -\"$pid\" 2>/dev/null; sleep 1; "
+        + "kill -KILL -\"$pid\" 2>/dev/null; "
         + "fi",
-        "pkill -f " + shlex.quote(script_pattern) + " 2>&1; echo \"pkill 脚本 rc=$?\"",
+        "pkill -f " + shlex.quote(script_pattern) + " 2>/dev/null",
     ]
     if keyword:
         kw_pattern = "[" + keyword[0] + "]" + keyword[1:]
         parts += [
-            "pkill -f " + shlex.quote(kw_pattern) + " 2>&1; echo \"pkill 节点 rc=$?\"",
-            "pkill -9 -f " + shlex.quote(kw_pattern) + " 2>&1; echo \"pkill -9 节点 rc=$?\"",
+            "pkill -f " + shlex.quote(kw_pattern) + " 2>/dev/null",
+            "pkill -9 -f " + shlex.quote(kw_pattern) + " 2>/dev/null",
         ]
     parts += [
         "rm -f \"$pidfile\"",
-        "echo \"== 停止后相关进程 ==\"",
-        "ps -ef | grep -E 'bringup|depth_image_bridge|camera_container|fastdds' | grep -v grep || echo \"(无相关进程)\"",
     ]
     return " ; ".join(parts)
 
@@ -130,6 +129,8 @@ class PerceptionApp:
         self.check_stop = threading.Event()
         self.message_queue = queue.Queue()
         self.panel_running = [None] * len(self.panels)
+        self.panel_op = [None] * len(self.panels)
+        self._panel_op_seq = 0
         self.panel_start_buttons = {}
         self.panel_stop_buttons = {}
         self.panel_detect_buttons = {}
@@ -207,9 +208,20 @@ class PerceptionApp:
                 ),
                 "detect_command": detect_command(self.workdir),
                 "detect_keyword": panel.get("detect_keyword", ""),
+                "start_timeout": panel.get("start_timeout"),
+                "stop_timeout": panel.get("stop_timeout"),
             }
             for panel in self.profile["panels"]
         ]
+
+    def _panel_op_timeout(self, index, kind):
+        """该面板的启动/停止确认超时：优先取面板配置，缺省用全局默认。"""
+        panel = self.panels[index]
+        value = panel.get(kind + "_timeout")
+        try:
+            return float(value) if value else PANEL_OP_TIMEOUT[kind]
+        except (TypeError, ValueError):
+            return PANEL_OP_TIMEOUT[kind]
 
     def _create_vars(self):
         self.host_var = tk.StringVar()
@@ -483,15 +495,6 @@ class PerceptionApp:
         tk.Frame(inner, bg=COLORS["border2"], height=1).pack(
             fill="x", pady=(10, 0)
         )
-        tk.Label(
-            inner, text="启动命令", bg=COLORS["panel"], fg=COLORS["muted"],
-            font=(self.font_family, 9),
-        ).pack(anchor="w", pady=(8, 2))
-        tk.Label(
-            inner, text=panel["start_command"], bg=COLORS["panel"],
-            fg=COLORS["muted"], font=(self.number_family, 9), anchor="w",
-            justify="left", wraplength=500,
-        ).pack(fill="x")
 
     def _build_log_card(self, main):
         card = tk.Frame(
@@ -631,6 +634,10 @@ class PerceptionApp:
             except ValueError as exc:
                 self._post_status("bad", "配置无效", str(exc))
             for index in range(len(self.panels)):
+                if self.panel_op[index] is not None:
+                    # 该面板正在“启动中…/停止中…”后台确认中，状态由
+                    # _post_op_detect 负责，自动巡检不要用旧检测结果覆盖
+                    continue
                 self._detect(index, settings)
         finally:
             self.checking = False
@@ -646,8 +653,15 @@ class PerceptionApp:
             self._post_status("bad", "配置无效", str(exc))
             return
         self._set_command_busy(True)
+        self._panel_op_seq += 1
+        seq = self._panel_op_seq
+        self.panel_op[index] = (
+            "start", time.monotonic() + self._panel_op_timeout(index, "start"), seq
+        )
+        self._post_panel_status(index, True, "check", "启动中…", "")
         threading.Thread(
-            target=self._panel_op_worker, args=("start", index, settings), daemon=True
+            target=self._panel_op_worker,
+            args=("start", index, settings, seq), daemon=True,
         ).start()
 
     def panel_stop(self, index):
@@ -660,8 +674,15 @@ class PerceptionApp:
             self._post_status("bad", "配置无效", str(exc))
             return
         self._set_command_busy(True)
+        self._panel_op_seq += 1
+        seq = self._panel_op_seq
+        self.panel_op[index] = (
+            "stop", time.monotonic() + self._panel_op_timeout(index, "stop"), seq
+        )
+        self._post_panel_status(index, None, "check", "停止中…", "")
         threading.Thread(
-            target=self._panel_op_worker, args=("stop", index, settings), daemon=True
+            target=self._panel_op_worker,
+            args=("stop", index, settings, seq), daemon=True,
         ).start()
 
     def panel_detect(self, index):
@@ -700,7 +721,7 @@ class PerceptionApp:
             self.checking = False
             self.checking_since = None
 
-    def _detect(self, index, settings):
+    def _detect(self, index, settings, quiet=False):
         panel = self.panels[index]
         name = panel["name"]
         try:
@@ -708,23 +729,27 @@ class PerceptionApp:
                 settings, panel["detect_command"], timeout=20
             )
         except paramiko.AuthenticationException:
-            self._post_panel_status(
-                index, False, "idle", "未启动", "检测失败：认证失败"
-            )
-            self._post_log(f"{name} 检测失败：认证失败", "bad")
+            if not quiet:
+                self._post_panel_status(
+                    index, False, "idle", "未启动", "检测失败：认证失败"
+                )
+                self._post_log(f"{name} 检测失败：认证失败", "bad")
             return None
         except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
             message = str(exc).strip() or type(exc).__name__
-            self._post_panel_status(index, False, "idle", "未启动", f"检测失败：{message}")
-            self._post_log(f"{name} 检测失败：{message}", "bad")
+            if not quiet:
+                self._post_panel_status(index, False, "idle", "未启动", f"检测失败：{message}")
+                self._post_log(f"{name} 检测失败：{message}", "bad")
             return None
         except ValueError as exc:
-            self._post_panel_status(index, False, "idle", "未启动", f"配置无效：{exc}")
+            if not quiet:
+                self._post_panel_status(index, False, "idle", "未启动", f"配置无效：{exc}")
             return None
         if code != 0:
             message = (err.strip() or out.strip() or f"退出码 {code}")[:120]
-            self._post_panel_status(index, False, "idle", "未启动", f"检测失败：{message}")
-            self._post_log(f"{name} 检测失败：{message}", "bad")
+            if not quiet:
+                self._post_panel_status(index, False, "idle", "未启动", f"检测失败：{message}")
+                self._post_log(f"{name} 检测失败：{message}", "bad")
             return None
         nodes = [line.strip() for line in out.splitlines() if line.strip()]
         keyword = (panel.get("detect_keyword") or "").strip()
@@ -734,30 +759,43 @@ class PerceptionApp:
         else:
             running = bool(nodes)
             reason = f"发现 {len(nodes)} 个节点" if nodes else "没有发现节点"
-        self._post_panel_status(
-            index, running, "ok" if running else "idle",
-            "已启动" if running else "未启动", reason,
-        )
+        if not quiet:
+            self._post_panel_status(
+                index, running, "ok" if running else "idle",
+                "已启动" if running else "未启动", reason,
+            )
         return running
 
-    def _panel_op_worker(self, kind, index, settings):
+    def _panel_op_worker(self, kind, index, settings, seq):
         label = "启动" if kind == "start" else "停止"
         panel = self.panels[index]
         name = panel["name"]
         command = panel["start_command"] if kind == "start" else panel["stop_command"]
-        self._post_log(f"正在通过 SSH {label} {name}: {command}", "muted")
+        self._post_log(f"正在通过 SSH {label} {name}...", "muted")
         try:
             code, out, err = self.manager.run(settings, command)
         except paramiko.AuthenticationException:
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
             self._post_log(f"{name} {label}失败：认证失败", "bad")
+            self._clear_panel_op(index, seq)
+            self._post_panel_status(
+                index, None, "bad", f"{label}失败", "认证失败"
+            )
         except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
             message = str(exc).strip() or type(exc).__name__
             self._post_status("bad", "无法连接", message)
             self._post_log(f"{name} {label}失败：{message}", "bad")
+            self._clear_panel_op(index, seq)
+            self._post_panel_status(
+                index, None, "bad", f"{label}失败", message
+            )
         except ValueError as exc:
             self._post_status("bad", "配置无效", str(exc))
             self._post_log(f"{name} {label}失败：{exc}", "bad")
+            self._clear_panel_op(index, seq)
+            self._post_panel_status(
+                index, None, "bad", f"{label}失败", str(exc)
+            )
         else:
             tag = "ok" if code == 0 else "bad"
             self._post_log(f"{name} {label}命令执行完成，退出码 {code}", tag)
@@ -766,32 +804,92 @@ class PerceptionApp:
             if err.strip():
                 self._post_log(err.rstrip(), "bad")
             if code == 0:
-                # 停止后 ROS 图刷新可能滞后约 10 秒（ros2 node list 的
-                # 守护进程/DDS 发现），等久一点再检测，避免显示残留节点
-                wait = 2.0 if kind == "start" else 12.0
-                self._post_log(
-                    f"等待 {int(wait)} 秒后自动检测 {name} 状态...", "muted"
+                # 后台等待并检测状态，不占用界面按钮
+                threading.Thread(
+                    target=self._post_op_detect,
+                    args=(kind, index, settings, seq), daemon=True,
+                ).start()
+            else:
+                self._clear_panel_op(index, seq)
+                self._post_panel_status(
+                    index, None, "bad", f"{label}失败", f"退出码 {code}"
                 )
-                time.sleep(wait)
-                started = self._detect(index, settings)
-                if kind == "start" and started is False:
-                    log_path = "/tmp/" + panel["script"] + ".log"
-                    self._post_log(
-                        f"{name} 未检测到节点，读取启动日志 {log_path} 排查：", "bad"
-                    )
-                    try:
-                        code2, out2, err2 = self.manager.run(
-                            settings, "tail -n 25 " + shlex.quote(log_path)
-                        )
-                    except Exception:
-                        pass
-                    else:
-                        if out2.strip():
-                            self._post_log(out2.rstrip(), "out")
-                        if err2.strip():
-                            self._post_log(err2.rstrip(), "bad")
         finally:
             self.message_queue.put(("busy", False))
+
+    def _post_op_detect(self, kind, index, settings, seq):
+        """启动/停止命令成功后，在后台持续检测，确认或超时前保持“启动中…/停止中…”。"""
+        panel = self.panels[index]
+        name = panel["name"]
+        verb = "启动" if kind == "start" else "停止"
+        interval = 2.0
+        total = int(self._panel_op_timeout(index, kind))
+        target = True if kind == "start" else False
+        self._post_log(
+            f"{name} {verb}命令已执行，每 {int(interval)} 秒检测一次，"
+            f"最多等待 {total} 秒确认",
+            "muted",
+        )
+        confirmed = False
+        while True:
+            op = self.panel_op[index]
+            if op is None:
+                # 主线程超时处理已接管（已显示“启动超时/停止超时”）
+                break
+            if op[2] != seq:
+                # 已发起新的操作，本线程不再干预
+                return
+            remaining = op[1] - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, max(remaining, 0.1)))
+            result = self._detect(index, settings, quiet=True)
+            if result == target:
+                confirmed = True
+                break
+            if result is None:
+                self._post_log(
+                    f"{name} {verb}期间状态检测失败，继续等待...", "muted"
+                )
+        if confirmed:
+            if kind == "start":
+                self._post_panel_status(
+                    index, True, "ok", "已启动", "启动确认：检测到节点"
+                )
+                self._post_log(f"{name} 启动成功，已检测到节点", "ok")
+            else:
+                self._post_panel_status(
+                    index, False, "idle", "未启动", "停止确认：节点已消失"
+                )
+                self._post_log(f"{name} 停止成功，节点已消失", "ok")
+            self._clear_panel_op(index, seq)
+            return
+        if kind == "start":
+            self._post_log(
+                f"{name} 在 {total} 秒内未检测到节点，读取启动日志排查：", "bad"
+            )
+            self._dump_script_log(index, settings)
+        else:
+            self._post_log(
+                f"{name} 在 {total} 秒内节点仍未消失，请检查停止命令", "bad"
+            )
+
+    def _dump_script_log(self, index, settings):
+        """通过 SSH 读取对应启动脚本的日志末尾，用于启动失败排查。"""
+        panel = self.panels[index]
+        log_path = "/tmp/" + panel["script"] + ".log"
+        self._post_log(f"读取日志 {log_path}：", "muted")
+        try:
+            code2, out2, err2 = self.manager.run(
+                settings, "tail -n 25 " + shlex.quote(log_path)
+            )
+        except Exception:
+            pass
+        else:
+            if out2.strip():
+                self._post_log(out2.rstrip(), "out")
+            if err2.strip():
+                self._post_log(err2.rstrip(), "bad")
 
     def _set_command_busy(self, busy):
         self.command_busy = busy
@@ -851,6 +949,7 @@ class PerceptionApp:
             ).start()
 
     def _poll_messages(self):
+        self._check_panel_op_timeouts()
         try:
             while True:
                 kind, *payload = self.message_queue.get_nowait()
@@ -858,7 +957,7 @@ class PerceptionApp:
                     self._set_header_status(*payload)
                 elif kind == "panel_status":
                     index, running, state_kind, text, detail = payload
-                    if state_kind != "check":
+                    if running is not None:
                         self.panel_running[index] = running
                     self.panel_status_vars[index].set(text)
                     self.panel_status_labels[index].configure(
@@ -879,6 +978,33 @@ class PerceptionApp:
             pass
         if not self.check_stop.is_set():
             self.root.after(60, self._poll_messages)
+
+    def _check_panel_op_timeouts(self):
+        """启动/停止后台确认超时检查：超过时限还没出结果就显示超时。"""
+        now = time.monotonic()
+        for index, op in enumerate(self.panel_op):
+            if op is None or now < op[1]:
+                continue
+            kind, _deadline, _seq = op
+            self._clear_panel_op(index, _seq)
+            seconds = int(self._panel_op_timeout(index, kind))
+            name = self.panels[index]["name"]
+            self._post_panel_status(
+                index, False, "bad",
+                "启动超时" if kind == "start" else "停止超时",
+                f"超过 {seconds} 秒未确认状态",
+            )
+            self._post_log(
+                f"{name} {('启动' if kind == 'start' else '停止')}超时："
+                f"超过 {seconds} 秒未确认，请检查机器人上的进程",
+                "bad",
+            )
+
+    def _clear_panel_op(self, index, seq):
+        """仅当该面板当前操作仍是本次序号时才清除，避免旧检测误清新操作。"""
+        op = self.panel_op[index]
+        if op is not None and op[2] == seq:
+            self.panel_op[index] = None
 
     def _append_log(self, text, tag):
         self.log_text.configure(state="normal")
