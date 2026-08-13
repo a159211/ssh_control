@@ -72,7 +72,10 @@ sudo apt install python3-tk python3-venv
   `/opt/ac_ws/logs/start_all.pid` 中的 PID 判断运控程序是否还在运行，
   即使程序在界面外被关闭也会自动更新为“未启动”
 - 运控界面显示电量：按检测间隔读取 `/opt/ac_ws/logs/bms_driver.log` 中
-  最新的 `current battery soc N%`，显示剩余电量百分比和进度条
+  最新的 SOC 百分比（兼容 `current battery soc` / `battery soc` / `soc` /
+  `电量` 等常见写法，并自动去掉日志里的 ANSI 颜色转义）显示进度条；
+  读取失败时电量旁会直接显示具体原因（文件不存在、权限不足、日志里
+  没有电量行等），并把实际读到的日志内容输出到下方日志区
 - 界面上显示 `192.168.44.100` 是否已连接，也可以点“立即检测”手动检查
 - “启动”执行 `cd /opt/ac_ws && sudo ./robot_service.sh`
 - “停止”执行 `cd /opt/ac_ws && sudo ./robot_service.sh stop`

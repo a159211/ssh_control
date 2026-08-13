@@ -141,11 +141,19 @@ def save_config(config_path, config):
         pass
 
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(text):
+    """去掉日志里的 ANSI 颜色转义序列（如 \\x1b[35m ... \\x1b[0m）。"""
+    return ANSI_ESCAPE.sub("", text)
+
+
 def parse_battery_soc(text):
-    """从 bms_driver 日志文本里提取最后一个 SOC 百分比。"""
+    """从 bms_driver 日志文本里提取最后一个 SOC 百分比，兼容常见写法。"""
     matches = re.findall(
-        r"current battery soc\s*[:=]?\s*(\d{1,3})\s*%",
-        text,
+        r"(?:current\s+)?(?:battery\s+)?(?:soc|电量)\s*[:=：]?\s*(\d{1,3})\s*[%％]",
+        strip_ansi(text),
         re.IGNORECASE,
     )
     if not matches:
@@ -371,7 +379,7 @@ class SshManager:
 
     def read_battery_soc(self, settings, log_path, timeout=15):
         """读取远端电量日志末尾，返回日志文本，找不到 SOC 由调用方处理。"""
-        command = "tail -n 200 " + shlex.quote(log_path)
+        command = "tail -n 500 " + shlex.quote(log_path)
         code, out, err = self.run(settings, command, timeout=timeout)
         if code != 0 and settings.get("password"):
             code, out, err = self.run(
@@ -379,7 +387,7 @@ class SshManager:
             )
         if code != 0:
             raise OSError(err.strip() or out.strip() or "读取电量日志失败")
-        return out
+        return strip_ansi(out)
 
 
 class RobotYaml:
@@ -833,6 +841,7 @@ class SshControlApp:
         self.last_check_var = tk.StringVar(value="")
         self.battery_soc_var = tk.StringVar(value="未知")
         self.battery_time_var = tk.StringVar(value="")
+        self._last_battery_fail = None
 
         self.start_cmd_var.trace_add("write", lambda *_: self._update_command_buttons())
         self.stop_cmd_var.trace_add("write", lambda *_: self._update_command_buttons())
@@ -1223,17 +1232,24 @@ class SshControlApp:
             self.battery_soc_label = tk.Label(
                 battery_row, textvariable=self.battery_soc_var,
                 bg=COLORS["panel"], fg=COLORS["muted"],
-                font=(self.font_family, 10, "bold"),
+                font=(self.font_family, 12, "bold"),
             )
             self.battery_soc_label.pack(side="left", padx=(6, 0))
-            self.battery_bar_width = 140
+            self.battery_bar_width = 280
+            self.battery_bar_height = 20
             self.battery_canvas = tk.Canvas(
-                battery_row, width=self.battery_bar_width, height=10,
-                bg=COLORS["panel2"], highlightthickness=0,
+                battery_row, width=self.battery_bar_width,
+                height=self.battery_bar_height, bg=COLORS["panel2"],
+                highlightthickness=1, highlightbackground=COLORS["border2"],
             )
             self.battery_canvas.pack(side="left", padx=(10, 0))
+            self.battery_track = self.battery_canvas.create_rectangle(
+                1, 1, self.battery_bar_width - 2, self.battery_bar_height - 2,
+                outline=COLORS["border"], fill=COLORS["panel2"], width=1,
+            )
             self.battery_fill = self.battery_canvas.create_rectangle(
-                0, 0, 0, 10, fill=COLORS["muted"], outline=""
+                3, 3, 3, self.battery_bar_height - 3,
+                fill=COLORS["muted"], outline="",
             )
             tk.Label(
                 battery_row, textvariable=self.battery_time_var,
@@ -1732,17 +1748,43 @@ class SshControlApp:
             except ValueError as exc:
                 self._post_log(f"状态检测失败：{exc}", "bad")
             if self.bms_log_path:
-                try:
-                    text = self.manager.read_battery_soc(
-                        settings, self.bms_log_path
-                    )
-                    soc = parse_battery_soc(text)
-                except (paramiko.AuthenticationException, socket.timeout,
-                        socket.gaierror, paramiko.SSHException, OSError, ValueError):
-                    soc = None
-                self.message_queue.put(("battery", soc))
+                soc, detail, raw = self._read_battery(settings)
+                self.message_queue.put(("battery", soc, detail, raw))
         finally:
             self.message_queue.put(("busy", False))
+
+    def _read_battery(self, settings):
+        """读取电量日志，返回 (soc, 失败原因, 原始日志文本)。
+
+        失败时把原因和实际读到的日志内容输出到日志区（连续相同则去重，
+        避免自动检测时刷屏）。
+        """
+        try:
+            text = self.manager.read_battery_soc(settings, self.bms_log_path)
+        except (paramiko.AuthenticationException, socket.timeout,
+                socket.gaierror, paramiko.SSHException, OSError, ValueError) as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            self._log_battery_fail(detail, "")
+            return None, detail, ""
+        soc = parse_battery_soc(text)
+        if soc is None:
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            raw = "\n".join(lines[-6:]) if lines else "(日志为空)"
+            detail = "日志中未找到电量（期望类似 soc: 85%）"
+            self._log_battery_fail(detail, raw)
+            return None, detail, raw
+        self._last_battery_fail = None
+        return soc, "", ""
+
+    def _log_battery_fail(self, detail, raw):
+        key = (detail, raw)
+        if self._last_battery_fail == key:
+            return
+        self._last_battery_fail = key
+        if raw:
+            self._post_log(f"电量读取失败：{detail}，读到内容：\n{raw}", "bad")
+        else:
+            self._post_log(f"电量读取失败：{detail}", "bad")
 
     def _build_log_card(self, main):
         card = tk.Frame(
@@ -1805,12 +1847,14 @@ class SshControlApp:
         suffix = f" · {detail}" if detail else ""
         self.last_check_var.set(f"最后检测 {time.strftime('%H:%M:%S')}{suffix}")
 
-    def _set_battery(self, soc):
+    def _set_battery(self, soc, detail="", raw=""):
         if soc is None:
             text = "读取失败"
             color = COLORS["muted"]
-            width = 0
-            time_text = ""
+            width = 3
+            time_text = (detail or raw or "").strip().replace("\n", " ")
+            if len(time_text) > 46:
+                time_text = time_text[:46] + "…"
         else:
             text = f"{soc}%"
             color = (
@@ -1818,13 +1862,16 @@ class SshControlApp:
                 else COLORS["warn"] if soc >= 20
                 else COLORS["danger"]
             )
-            width = int(self.battery_bar_width * soc / 100.0)
+            width = int((self.battery_bar_width - 6) * soc / 100.0) + 3
+            width = max(3, min(width, self.battery_bar_width - 3))
             time_text = f"更新 {time.strftime('%H:%M:%S')}"
         self.battery_soc_var.set(text)
         self.battery_time_var.set(time_text)
         self.battery_soc_label.configure(fg=color)
         self.battery_canvas.itemconfigure(self.battery_fill, fill=color)
-        self.battery_canvas.coords(self.battery_fill, 0, 0, width, 10)
+        self.battery_canvas.coords(
+            self.battery_fill, 3, 3, width, self.battery_bar_height - 3
+        )
 
     def _post_status(self, kind, text, detail=""):
         self.message_queue.put(("status", kind, text, detail))
@@ -1918,13 +1965,8 @@ class SshControlApp:
             pass
         if not self.bms_log_path:
             return
-        try:
-            text = self.manager.read_battery_soc(settings, self.bms_log_path)
-            soc = parse_battery_soc(text)
-        except (paramiko.AuthenticationException, socket.timeout,
-                socket.gaierror, paramiko.SSHException, OSError, ValueError):
-            soc = None
-        self.message_queue.put(("battery", soc))
+        soc, detail, raw = self._read_battery(settings)
+        self.message_queue.put(("battery", soc, detail, raw))
 
     def run_start(self):
         if self.service_running is True:
@@ -2047,7 +2089,7 @@ class SshControlApp:
                             "ok" if running else "muted",
                         )
                 elif kind == "battery":
-                    self._set_battery(payload[0])
+                    self._set_battery(*payload)
                 elif kind == "status_refresh":
                     self.root.after(300, self._check_status)
                 elif kind == "params_loaded":
