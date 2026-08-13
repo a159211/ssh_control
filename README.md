@@ -68,6 +68,11 @@ sudo apt install python3-tk python3-venv
 ## 功能
 
 - 主机、端口、用户名、密码或私钥填好后会自动检测连接状态
+- 自动检测连接时同步刷新运行状态：读取
+  `/opt/ac_ws/logs/start_all.pid` 中的 PID 判断运控程序是否还在运行，
+  即使程序在界面外被关闭也会自动更新为“未启动”
+- 运控界面显示电量：按检测间隔读取 `/opt/ac_ws/logs/bms_driver.log` 中
+  最新的 `current battery soc N%`，显示剩余电量百分比和进度条
 - 界面上显示 `192.168.44.100` 是否已连接，也可以点“立即检测”手动检查
 - “启动”执行 `cd /opt/ac_ws && sudo ./robot_service.sh`
 - “停止”执行 `cd /opt/ac_ws && sudo ./robot_service.sh stop`
@@ -92,7 +97,6 @@ sudo apt install python3-tk python3-venv
   兜底，并在日志里输出 pid 文件内容和停止后仍存活的相关进程；停止后等待约
   12 秒再检测（ROS 图刷新滞后约 10 秒，避免显示已杀掉的残留节点）
 - 命令里包含 `sudo` 时，程序会自动把保存的密码通过 stdin 输入
-- 读取 `/opt/ac_ws/logs/start_all.pid` 中的 PID，检查进程是否存活来显示状态
 - 拖入或选择的文件会上传到 `/opt/ac_ws/models/`
 - 可以读取 `/opt/ac_ws/config/robot.yaml` 中 `robot`、`run_gait`、
   `camera_perceptied` 下的 4 个模型 `name`，修改后保存，注释会保留

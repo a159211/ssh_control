@@ -43,6 +43,7 @@ CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ssh_control.json")
 DEFAULT_HOST = "192.168.44.100"
 REMOTE_CONFIG_PATH = "/opt/ac_ws/config/robot.yaml"
 DEFAULT_PID_PATH = "/opt/ac_ws/logs/start_all.pid"
+BMS_LOG_PATH = "/opt/ac_ws/logs/bms_driver.log"
 MODEL_PATH_LABELS = {
     ("robot", "first_model_config"): "robot / first",
     ("robot", "second_model_config"): "robot / second",
@@ -87,6 +88,7 @@ PROFILES = {
         "config_path": CONFIG_PATH,
         "remote_config_path": REMOTE_CONFIG_PATH,
         "pid_path": DEFAULT_PID_PATH,
+        "bms_log_path": BMS_LOG_PATH,
         "model_labels": MODEL_PATH_LABELS,
         "show_config": True,
         "show_upload": True,
@@ -137,6 +139,18 @@ def save_config(config_path, config):
         os.chmod(CONFIG_PATH, 0o600)
     except OSError:
         pass
+
+
+def parse_battery_soc(text):
+    """从 bms_driver 日志文本里提取最后一个 SOC 百分比。"""
+    matches = re.findall(
+        r"current battery soc\s*[:=]?\s*(\d{1,3})\s*%",
+        text,
+        re.IGNORECASE,
+    )
+    if not matches:
+        return None
+    return max(0, min(100, int(matches[-1])))
 
 
 class SshManager:
@@ -354,6 +368,18 @@ class SshManager:
             if code != 0:
                 raise OSError(f"状态检测失败：{err.strip() or out.strip()}")
         return "RUNNING" in out, pid_path
+
+    def read_battery_soc(self, settings, log_path, timeout=15):
+        """读取远端电量日志末尾，返回日志文本，找不到 SOC 由调用方处理。"""
+        command = "tail -n 200 " + shlex.quote(log_path)
+        code, out, err = self.run(settings, command, timeout=timeout)
+        if code != 0 and settings.get("password"):
+            code, out, err = self.run(
+                settings, "sudo " + command, timeout=timeout
+            )
+        if code != 0:
+            raise OSError(err.strip() or out.strip() or "读取电量日志失败")
+        return out
 
 
 class RobotYaml:
@@ -711,6 +737,7 @@ class SshControlApp:
             "remote_config_path", REMOTE_CONFIG_PATH
         )
         self.pid_path = self.profile.get("pid_path", DEFAULT_PID_PATH)
+        self.bms_log_path = self.profile.get("bms_log_path", "")
         self.model_labels = self.profile.get("model_labels", MODEL_PATH_LABELS)
         self.show_config = self.profile.get("show_config", True)
         self.show_upload = self.profile.get("show_upload", True)
@@ -718,7 +745,6 @@ class SshControlApp:
         self.checking = False
         self.command_busy = False
         self.show_password = False
-        self.service_status_checked = False
         self.service_running = None
         self.param_windows = {}
         self.check_stop = threading.Event()
@@ -805,6 +831,8 @@ class SshControlApp:
         self.service_status_var = tk.StringVar(value="未检测")
         self.status_var = tk.StringVar(value="等待配置")
         self.last_check_var = tk.StringVar(value="")
+        self.battery_soc_var = tk.StringVar(value="未知")
+        self.battery_time_var = tk.StringVar(value="")
 
         self.start_cmd_var.trace_add("write", lambda *_: self._update_command_buttons())
         self.stop_cmd_var.trace_add("write", lambda *_: self._update_command_buttons())
@@ -967,7 +995,7 @@ class SshControlApp:
         options = tk.Frame(inner, bg=COLORS["panel"])
         options.pack(fill="x", pady=(8, 0))
         tk.Checkbutton(
-            options, text="自动检测连接", variable=self.auto_check_var,
+            options, text="自动检测", variable=self.auto_check_var,
             bg=COLORS["panel"], fg=COLORS["fg"], selectcolor=COLORS["panel2"],
             activebackground=COLORS["panel"], activeforeground=COLORS["fg"],
             highlightthickness=0,
@@ -1184,6 +1212,34 @@ class SshControlApp:
             activeforeground=COLORS["fg"], relief="flat", padx=10, pady=2,
         )
         self.status_check_button.pack(side="right")
+
+        if self.bms_log_path:
+            battery_row = tk.Frame(inner, bg=COLORS["panel"])
+            battery_row.pack(fill="x", pady=(8, 0))
+            tk.Label(
+                battery_row, text="电量:", bg=COLORS["panel"],
+                fg=COLORS["muted"], font=(self.font_family, 10),
+            ).pack(side="left")
+            self.battery_soc_label = tk.Label(
+                battery_row, textvariable=self.battery_soc_var,
+                bg=COLORS["panel"], fg=COLORS["muted"],
+                font=(self.font_family, 10, "bold"),
+            )
+            self.battery_soc_label.pack(side="left", padx=(6, 0))
+            self.battery_bar_width = 140
+            self.battery_canvas = tk.Canvas(
+                battery_row, width=self.battery_bar_width, height=10,
+                bg=COLORS["panel2"], highlightthickness=0,
+            )
+            self.battery_canvas.pack(side="left", padx=(10, 0))
+            self.battery_fill = self.battery_canvas.create_rectangle(
+                0, 0, 0, 10, fill=COLORS["muted"], outline=""
+            )
+            tk.Label(
+                battery_row, textvariable=self.battery_time_var,
+                bg=COLORS["panel"], fg=COLORS["muted"],
+                font=(self.font_family, 9),
+            ).pack(side="right")
 
     def _build_upload_card(self, main):
         card = tk.Frame(
@@ -1661,19 +1717,30 @@ class SshControlApp:
     def _status_worker(self, settings):
         self._post_log("正在检测运行状态...", "muted")
         try:
-            running, pid_path = self.manager.check_service_status(
-                settings, self.pid_path
-            )
-            self.message_queue.put(("service_status", running, pid_path))
-        except paramiko.AuthenticationException:
-            self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
-            self._post_log("状态检测失败：认证失败", "bad")
-        except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
-            message = str(exc).strip() or type(exc).__name__
-            self._post_status("bad", "无法连接", message)
-            self._post_log(f"状态检测失败：{message}", "bad")
-        except ValueError as exc:
-            self._post_log(f"状态检测失败：{exc}", "bad")
+            try:
+                running, pid_path = self.manager.check_service_status(
+                    settings, self.pid_path
+                )
+                self.message_queue.put(("service_status", running, pid_path))
+            except paramiko.AuthenticationException:
+                self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
+                self._post_log("状态检测失败：认证失败", "bad")
+            except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
+                message = str(exc).strip() or type(exc).__name__
+                self._post_status("bad", "无法连接", message)
+                self._post_log(f"状态检测失败：{message}", "bad")
+            except ValueError as exc:
+                self._post_log(f"状态检测失败：{exc}", "bad")
+            if self.bms_log_path:
+                try:
+                    text = self.manager.read_battery_soc(
+                        settings, self.bms_log_path
+                    )
+                    soc = parse_battery_soc(text)
+                except (paramiko.AuthenticationException, socket.timeout,
+                        socket.gaierror, paramiko.SSHException, OSError, ValueError):
+                    soc = None
+                self.message_queue.put(("battery", soc))
         finally:
             self.message_queue.put(("busy", False))
 
@@ -1737,9 +1804,27 @@ class SshControlApp:
         self.status_var.set(text)
         suffix = f" · {detail}" if detail else ""
         self.last_check_var.set(f"最后检测 {time.strftime('%H:%M:%S')}{suffix}")
-        if kind == "ok" and not self.service_status_checked:
-            self.service_status_checked = True
-            self.root.after(300, self._check_status)
+
+    def _set_battery(self, soc):
+        if soc is None:
+            text = "读取失败"
+            color = COLORS["muted"]
+            width = 0
+            time_text = ""
+        else:
+            text = f"{soc}%"
+            color = (
+                COLORS["accent"] if soc >= 50
+                else COLORS["warn"] if soc >= 20
+                else COLORS["danger"]
+            )
+            width = int(self.battery_bar_width * soc / 100.0)
+            time_text = f"更新 {time.strftime('%H:%M:%S')}"
+        self.battery_soc_var.set(text)
+        self.battery_time_var.set(time_text)
+        self.battery_soc_label.configure(fg=color)
+        self.battery_canvas.itemconfigure(self.battery_fill, fill=color)
+        self.battery_canvas.coords(self.battery_fill, 0, 0, width, 10)
 
     def _post_status(self, kind, text, detail=""):
         self.message_queue.put(("status", kind, text, detail))
@@ -1810,6 +1895,7 @@ class SshControlApp:
             self.manager.connect(settings, force=force)
             elapsed = time.monotonic() - started
             self._post_status("ok", "已连接", f"耗时 {elapsed:.2f}s")
+            self._refresh_runtime(settings)
         except paramiko.AuthenticationException:
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
         except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
@@ -1819,6 +1905,26 @@ class SshControlApp:
             self._post_status("bad", "配置无效", str(exc))
         finally:
             self.checking = False
+
+    def _refresh_runtime(self, settings):
+        """自动检测时同步刷新运行状态与电量，单项失败不影响其他项。"""
+        try:
+            running, pid_path = self.manager.check_service_status(
+                settings, self.pid_path
+            )
+            self.message_queue.put(("service_status", running, pid_path, True))
+        except (paramiko.AuthenticationException, socket.timeout,
+                socket.gaierror, paramiko.SSHException, OSError, ValueError):
+            pass
+        if not self.bms_log_path:
+            return
+        try:
+            text = self.manager.read_battery_soc(settings, self.bms_log_path)
+            soc = parse_battery_soc(text)
+        except (paramiko.AuthenticationException, socket.timeout,
+                socket.gaierror, paramiko.SSHException, OSError, ValueError):
+            soc = None
+        self.message_queue.put(("battery", soc))
 
     def run_start(self):
         if self.service_running is True:
@@ -1923,17 +2029,25 @@ class SshControlApp:
                             names.get(".".join(path)) or ""
                         )
                 elif kind == "service_status":
-                    running, pid_path = payload
+                    running, pid_path = payload[0], payload[1]
+                    quiet = payload[2] if len(payload) > 2 else False
+                    changed = (
+                        self.service_running is None
+                        or self.service_running != running
+                    )
                     self.service_running = running
                     self.service_status_var.set("已启动" if running else "未启动")
                     self.service_status_label.configure(
                         fg=COLORS["accent"] if running else COLORS["muted"]
                     )
                     self._update_command_buttons()
-                    self._append_log(
-                        f"运行状态：{'已启动' if running else '未启动'}（{pid_path}）",
-                        "ok" if running else "muted",
-                    )
+                    if (quiet and changed) or not quiet:
+                        self._append_log(
+                            f"运行状态：{'已启动' if running else '未启动'}（{pid_path}）",
+                            "ok" if running else "muted",
+                        )
+                elif kind == "battery":
+                    self._set_battery(payload[0])
                 elif kind == "status_refresh":
                     self.root.after(300, self._check_status)
                 elif kind == "params_loaded":
