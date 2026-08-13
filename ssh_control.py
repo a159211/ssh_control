@@ -12,6 +12,7 @@ import queue
 import re
 import shlex
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
@@ -80,13 +81,48 @@ DEFAULTS = {
     "number_font": None,
 }
 
+PROFILES = {
+    "motion": {
+        "title": "SSH 远程控制 · 运控",
+        "config_path": CONFIG_PATH,
+        "remote_config_path": REMOTE_CONFIG_PATH,
+        "pid_path": DEFAULT_PID_PATH,
+        "model_labels": MODEL_PATH_LABELS,
+        "show_config": True,
+        "show_upload": True,
+        "defaults": DEFAULTS,
+    },
+    "perception": {
+        "title": "SSH 远程控制 · 感知",
+        "config_path": os.path.join(
+            os.path.expanduser("~"), ".ssh_control_perception.json"
+        ),
+        "workdir": "/home/ac/Documents/AC/work_ws",
+        "panels": [
+            {
+                "name": "FastDDS",
+                "script": "bringup1.sh",
+                "detect_keyword": "depth_image_bridge_node",
+            },
+            {
+                "name": "相机节点",
+                "script": "bringup2.sh",
+                "detect_keyword": "camera_container",
+            },
+        ],
+        "show_config": False,
+        "show_upload": False,
+        "defaults": DEFAULTS,
+    },
+}
 
-def load_config():
-    config = dict(DEFAULTS)
+
+def load_config(config_path, defaults):
+    config = dict(defaults)
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+        with open(config_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        for key in DEFAULTS:
+        for key in defaults:
             if key in data:
                 config[key] = data[key]
     except (OSError, ValueError, TypeError):
@@ -94,9 +130,9 @@ def load_config():
     return config
 
 
-def save_config(config):
+def save_config(config_path, config):
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+        with open(config_path, "w", encoding="utf-8") as handle:
             json.dump(config, handle, ensure_ascii=False, indent=2)
         os.chmod(CONFIG_PATH, 0o600)
     except OSError:
@@ -154,7 +190,7 @@ class SshManager:
         with self.lock:
             self._close_locked()
 
-    def run(self, settings, command):
+    def run(self, settings, command, timeout=60):
         with self.lock:
             if not self._connected_locked():
                 self._close_locked()
@@ -166,7 +202,10 @@ class SshManager:
                 if needs_sudo and password:
                     cleaned = re.sub(r"\bsudo\s+", "", command, count=1)
                     command = "sudo -S sh -c " + shlex.quote(cleaned)
-                stdin, stdout, stderr = client.exec_command(command, timeout=60)
+                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+                # exec_command 的 timeout 只作用于建立会话，读取必须单独设
+                # 超时，否则远端命令挂起时 read() 会无限阻塞、卡死界面
+                stdout.channel.settimeout(timeout)
                 if needs_sudo and password:
                     stdin.write(password + "\n")
                     stdin.flush()
@@ -187,6 +226,7 @@ class SshManager:
             raise PermissionError("目标目录没有写权限，且没有可用的 sudo 密码")
         sudo_command = "sudo -S sh -c " + shlex.quote(command)
         stdin, stdout, stderr = client.exec_command(sudo_command, timeout=30)
+        stdout.channel.settimeout(30)
         stdin.write(password + "\n")
         stdin.flush()
         stdin.channel.shutdown_write()
@@ -291,7 +331,7 @@ class SshManager:
                     password,
                 )
 
-    def check_service_status(self, settings, pid_path=DEFAULT_PID_PATH):
+    def check_service_status(self, settings, pid_path):
         command = (
             "if [ -f " + shlex.quote(pid_path) + " ]; then "
             "while read pid; do "
@@ -307,6 +347,7 @@ class SshManager:
             client = self.client
             wrapped = "sh -c " + shlex.quote(command)
             stdin, stdout, stderr = client.exec_command(wrapped, timeout=15)
+            stdout.channel.settimeout(15)
             out = stdout.read().decode("utf-8", "replace")
             err = stderr.read().decode("utf-8", "replace")
             code = stdout.channel.recv_exit_status()
@@ -660,8 +701,19 @@ class RobotYaml:
 
 
 class SshControlApp:
-    def __init__(self):
-        self.config = load_config()
+    def __init__(self, profile="motion"):
+        self.profile = PROFILES[profile]
+        self.config = load_config(
+            self.profile["config_path"], self.profile["defaults"]
+        )
+        self.title = self.profile["title"]
+        self.remote_config_path = self.profile.get(
+            "remote_config_path", REMOTE_CONFIG_PATH
+        )
+        self.pid_path = self.profile.get("pid_path", DEFAULT_PID_PATH)
+        self.model_labels = self.profile.get("model_labels", MODEL_PATH_LABELS)
+        self.show_config = self.profile.get("show_config", True)
+        self.show_upload = self.profile.get("show_upload", True)
         self.manager = SshManager()
         self.checking = False
         self.command_busy = False
@@ -673,7 +725,7 @@ class SshControlApp:
         self.message_queue = queue.Queue()
 
         self.root = TkinterDnD.Tk() if HAS_TKDND else tk.Tk()
-        self.root.title(APP_TITLE)
+        self.root.title(self.title)
         self.root.configure(bg=COLORS["bg"])
         self.root.geometry("1280x820")
         self.root.minsize(1000, 620)
@@ -683,7 +735,8 @@ class SshControlApp:
 
         self._create_vars()
         self._build_ui()
-        self._enable_drop_targets()
+        if self.show_upload:
+            self._enable_drop_targets()
         self._apply_config()
         self.auto_check_var.trace_add("write", lambda *_: self._auto_check_toggled())
         self._update_command_buttons()
@@ -758,13 +811,19 @@ class SshControlApp:
 
     def _apply_config(self):
         cfg = self.config
-        self.host_var.set(str(cfg.get("host") or DEFAULT_HOST))
+        self.host_var.set(
+            str(cfg.get("host") or self.profile["defaults"]["host"])
+        )
         self.port_var.set(str(cfg.get("port", 22)))
         self.username_var.set(str(cfg.get("username", "")))
         self.password_var.set(str(cfg.get("password", "")) if cfg.get("remember_password") else "")
         self.key_file_var.set(str(cfg.get("key_file", "")))
-        self.start_cmd_var.set(str(cfg.get("start_command") or DEFAULTS["start_command"]))
-        self.stop_cmd_var.set(str(cfg.get("stop_command") or DEFAULTS["stop_command"]))
+        self.start_cmd_var.set(
+            str(cfg.get("start_command") or self.profile["defaults"]["start_command"])
+        )
+        self.stop_cmd_var.set(
+            str(cfg.get("stop_command") or self.profile["defaults"]["stop_command"])
+        )
         self.interval_var.set(str(cfg.get("check_interval", 5)))
         self.auto_check_var.set(bool(cfg.get("auto_check", True)))
         self.remember_var.set(bool(cfg.get("remember_password", False)))
@@ -776,7 +835,7 @@ class SshControlApp:
         header = tk.Frame(main, bg=COLORS["bg"])
         header.pack(fill="x")
         tk.Label(
-            header, text=APP_TITLE, bg=COLORS["bg"], fg=COLORS["fg"],
+            header, text=self.title, bg=COLORS["bg"], fg=COLORS["fg"],
             font=(self.font_family, 16, "bold"),
         ).pack(side="left")
         self.status_canvas = tk.Canvas(
@@ -801,22 +860,42 @@ class SshControlApp:
         body.columnconfigure(0, weight=1, uniform="col")
         body.columnconfigure(1, weight=1, uniform="col")
         body.rowconfigure(0, weight=1, uniform="row")
-        body.rowconfigure(1, weight=1, uniform="row")
 
+        body.rowconfigure(1, weight=1, uniform="row")
         top_left = tk.Frame(body, bg=COLORS["bg"])
         top_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
         top_right = tk.Frame(body, bg=COLORS["bg"])
         top_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
-        bottom_left = tk.Frame(body, bg=COLORS["bg"])
-        bottom_left.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0))
-        bottom_right = tk.Frame(body, bg=COLORS["bg"])
-        bottom_right.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(6, 0))
-
         self._build_connection_card(top_left)
         self._build_command_card(top_right)
-        self._build_config_card(bottom_left)
-        self._build_upload_card(bottom_right)
-        self._build_log_card(main)
+
+        if self.show_config or self.show_upload:
+            bottom_left = tk.Frame(body, bg=COLORS["bg"])
+            bottom_right = tk.Frame(body, bg=COLORS["bg"])
+            if self.show_config and self.show_upload:
+                bottom_left.grid(
+                    row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0)
+                )
+                bottom_right.grid(
+                    row=1, column=1, sticky="nsew", padx=(6, 0), pady=(6, 0)
+                )
+                self._build_config_card(bottom_left)
+                self._build_upload_card(bottom_right)
+            elif self.show_config:
+                bottom_left.grid(
+                    row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0)
+                )
+                self._build_config_card(bottom_left)
+            else:
+                bottom_right.grid(
+                    row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0)
+                )
+                self._build_upload_card(bottom_right)
+            self._build_log_card(main)
+        else:
+            bottom = tk.Frame(body, bg=COLORS["bg"])
+            bottom.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+            self._build_log_card(bottom)
 
     def _build_connection_card(self, main):
         card = tk.Frame(
@@ -975,7 +1054,7 @@ class SshControlApp:
         config_title.pack(fill="x", pady=(10, 0))
         self._section_title(config_title, "远程配置")
         tk.Label(
-            config_title, text=REMOTE_CONFIG_PATH, bg=COLORS["panel"],
+            config_title, text=self.remote_config_path, bg=COLORS["panel"],
             fg=COLORS["muted"], font=(self.font_family, 9),
         ).pack(side="right")
 
@@ -983,7 +1062,7 @@ class SshControlApp:
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(1, weight=1)
         for row, path in enumerate(RobotYaml.PATHS):
-            self._grid_label(grid, MODEL_PATH_LABELS[path], row, 0)
+            self._grid_label(grid, self.model_labels[path], row, 0)
             self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
             self.param_buttons[path] = tk.Button(
                 grid, text="参数", command=lambda p=path: self._open_params(p),
@@ -1171,7 +1250,7 @@ class SshControlApp:
         title_row.pack(fill="x")
         self._section_title(title_row, "远程配置")
         tk.Label(
-            title_row, text=REMOTE_CONFIG_PATH, bg=COLORS["panel"],
+            title_row, text=self.remote_config_path, bg=COLORS["panel"],
             fg=COLORS["muted"], font=(self.font_family, 9),
         ).pack(side="right")
 
@@ -1179,7 +1258,7 @@ class SshControlApp:
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(1, weight=1)
         for row, path in enumerate(RobotYaml.PATHS):
-            self._grid_label(grid, MODEL_PATH_LABELS[path], row, 0)
+            self._grid_label(grid, self.model_labels[path], row, 0)
             self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
             self.param_buttons[path] = tk.Button(
                 grid, text="参数", command=lambda p=path: self._open_params(p),
@@ -1310,9 +1389,9 @@ class SshControlApp:
         ).start()
 
     def _read_config_worker(self, settings):
-        self._post_log(f"正在读取 {REMOTE_CONFIG_PATH}", "muted")
+        self._post_log(f"正在读取 {self.remote_config_path}", "muted")
         try:
-            text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
+            text = self.manager.read_remote_text(settings, self.remote_config_path)
             names = RobotYaml.read_names(text)
             self.message_queue.put(("config", names))
             self._post_log("配置读取完成", "ok")
@@ -1350,12 +1429,12 @@ class SshControlApp:
         ).start()
 
     def _save_config_worker(self, settings, values):
-        self._post_log(f"正在保存 {REMOTE_CONFIG_PATH}", "muted")
+        self._post_log(f"正在保存 {self.remote_config_path}", "muted")
         try:
-            text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
+            text = self.manager.read_remote_text(settings, self.remote_config_path)
             for path in RobotYaml.PATHS:
                 text = RobotYaml.update_name(text, path, values[path])
-            self.manager.write_remote_text(settings, REMOTE_CONFIG_PATH, text)
+            self.manager.write_remote_text(settings, self.remote_config_path, text)
             self._post_log("配置保存完成", "ok")
         except paramiko.AuthenticationException:
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
@@ -1382,7 +1461,7 @@ class SshControlApp:
             return
 
         win = tk.Toplevel(self.root)
-        win.title(f"参数 - {MODEL_PATH_LABELS[path]}")
+        win.title(f"参数 - {self.model_labels[path]}")
         win.configure(bg=COLORS["bg"])
         win.geometry("900x640")
         win.transient(self.root)
@@ -1391,7 +1470,7 @@ class SshControlApp:
         frame = tk.Frame(win, bg=COLORS["bg"], padx=14, pady=12)
         frame.pack(fill="both", expand=True)
         tk.Label(
-            frame, text=f"正在读取 {MODEL_PATH_LABELS[path]} 参数...",
+            frame, text=f"正在读取 {self.model_labels[path]} 参数...",
             bg=COLORS["bg"], fg=COLORS["muted"],
             font=(self.font_family, 10),
         ).pack(anchor="w")
@@ -1434,7 +1513,7 @@ class SshControlApp:
 
     def _load_params_worker(self, settings, path):
         try:
-            text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
+            text = self.manager.read_remote_text(settings, self.remote_config_path)
             block = RobotYaml.read_section_block(text, path)
             self.message_queue.put(("params_loaded", path, block))
         except paramiko.AuthenticationException:
@@ -1541,9 +1620,9 @@ class SshControlApp:
 
     def _save_params_worker(self, settings, path, new_block):
         try:
-            text = self.manager.read_remote_text(settings, REMOTE_CONFIG_PATH)
+            text = self.manager.read_remote_text(settings, self.remote_config_path)
             text = RobotYaml.replace_section_block(text, path, new_block)
-            self.manager.write_remote_text(settings, REMOTE_CONFIG_PATH, text)
+            self.manager.write_remote_text(settings, self.remote_config_path, text)
             self.message_queue.put(("params_saved", path))
         except paramiko.AuthenticationException:
             self.message_queue.put(
@@ -1582,7 +1661,9 @@ class SshControlApp:
     def _status_worker(self, settings):
         self._post_log("正在检测运行状态...", "muted")
         try:
-            running, pid_path = self.manager.check_service_status(settings)
+            running, pid_path = self.manager.check_service_status(
+                settings, self.pid_path
+            )
             self.message_queue.put(("service_status", running, pid_path))
         except paramiko.AuthenticationException:
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
@@ -1797,11 +1878,16 @@ class SshControlApp:
     def _set_command_busy(self, busy):
         self.command_busy = busy
         self._update_command_buttons()
-        self.detect_button.configure(state="disabled" if busy else "normal")
-        self.upload_button.configure(state="disabled" if busy else "normal")
-        self.config_read_button.configure(state="disabled" if busy else "normal")
-        self.config_save_button.configure(state="disabled" if busy else "normal")
-        self.status_check_button.configure(state="disabled" if busy else "normal")
+        for name in (
+            "detect_button",
+            "upload_button",
+            "config_read_button",
+            "config_save_button",
+            "status_check_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state="disabled" if busy else "normal")
 
     def _update_command_buttons(self):
         start_ready = (
@@ -1855,7 +1941,7 @@ class SshControlApp:
                 elif kind == "params_saved":
                     path = payload[0]
                     self._append_log(
-                        f"参数已保存：{MODEL_PATH_LABELS[path]}", "ok"
+                        f"参数已保存：{self.model_labels[path]}", "ok"
                     )
                     self._close_params(path)
                     self.root.after(200, self._read_config)
@@ -1920,7 +2006,7 @@ class SshControlApp:
             self.config["password"] = self.password_var.get()
         else:
             self.config.pop("password", None)
-        save_config(self.config)
+        save_config(self.profile["config_path"], self.config)
         if not silent:
             self._append_log("设置已保存", "ok")
 
@@ -1931,5 +2017,12 @@ class SshControlApp:
         self.root.destroy()
 
 
+def main():
+    profile = "motion"
+    if len(sys.argv) > 1 and sys.argv[1] in PROFILES:
+        profile = sys.argv[1]
+    SshControlApp(profile=profile).root.mainloop()
+
+
 if __name__ == "__main__":
-    SshControlApp().root.mainloop()
+    main()
