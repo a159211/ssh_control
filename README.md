@@ -13,10 +13,15 @@ Ubuntu / Debian：
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-tk python3-venv
+sudo apt install python3 python3-tk python3-venv fonts-noto-cjk fontconfig
+fc-cache -fv
 ```
 
-其他发行版安装对应的 Python、Tk 和 venv 组件。
+`fonts-noto-cjk` 提供中文字体，避免缺少字体时出现中文锯齿或显示异常；
+`fc-cache -fv` 用于刷新字体缓存。如果程序已打开，安装完成后请关闭并重新启动。
+
+其他发行版安装对应的 Python、Tk、venv、Noto CJK 字体和 fontconfig 组件，
+安装后同样执行 `fc-cache -fv`。
 
 ### 2. 安装项目依赖
 
@@ -37,6 +42,7 @@ bash run.sh
 ```
 
 后续启动只需执行这条命令，无需重复安装依赖。
+如果安装中文字体并重启程序后仍显示异常，请检查系统缩放和 Tk 字体渲染设置。
 
 ## 使用说明
 
