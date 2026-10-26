@@ -1,65 +1,58 @@
 # SSH 远程控制
 
-独立的 SSH 远程控制面板：默认检测 `192.168.44.100` 是否能连上，自动重连，
-点击“启动 / 停止”即可在远程主机上执行固定命令。
+基于 Python 和 Tkinter 的运控面板，通过 SSH 连接机器人，支持服务启停、
+运行状态与开机自启动状态查看、电量显示、模型上传和远程参数编辑。
 
-## 运行
+## 环境配置
 
-```bash
-cd ssh_control
-./run.sh
-```
+需要带桌面环境的 Linux、Python 3（建议 3.12+），以及可联网的依赖安装环境。
 
-也可以手动运行：
+### 1. 安装系统依赖
 
-```bash
-cd ssh_control
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python ssh_control.py
-```
-
-程序会优先使用项目内的 `.venv` 环境；如果 `.venv` 不存在，才回退到本机
-`vendor/` 目录加 `/usr/bin/python3` 的启动方式。
-
-## 在 Linux 其他电脑上配置环境
-
-`vendor/` 目录只适配当前这台机器，换电脑后不要依赖它，用下面的方式重新
-配置：
+Ubuntu / Debian：
 
 ```bash
-cd ssh_control
-./setup.sh
-./run.sh
+sudo apt update
+sudo apt install python3 python3-tk python3-venv
 ```
 
-Debian / Ubuntu 如果提示缺少 tkinter 或 venv：
+其他发行版安装对应的 Python、Tk 和 venv 组件。
+
+### 2. 安装项目依赖
+
+进入项目目录，执行初始化脚本：
 
 ```bash
-sudo apt install python3-tk python3-venv
+cd /你的项目路径/ssh_control
+bash setup.sh
 ```
 
-其他发行版需要确保系统里有 Python 3.12+、Tk 和 venv 组件。
+脚本会创建 `.venv` 虚拟环境，并安装 `requirements.txt` 中的依赖。
+换电脑后请重新执行此步骤，不要直接使用原电脑的 `.venv` 或 `vendor/`。
 
-## 功能
-
-- 主机、端口、用户名、密码或私钥填好后会自动检测连接状态
-- 界面上显示 `192.168.44.100` 是否已连接，也可以点“立即检测”手动检查
-- “启动”执行 `cd /opt/ac_ws && sudo ./robot_service.sh`
-- “停止”执行 `cd /opt/ac_ws && sudo ./robot_service.sh stop`
-- 命令里包含 `sudo` 时，程序会自动把保存的密码通过 stdin 输入
-- 读取 `/opt/ac_ws/logs/start_all.pid` 中的 PID，检查进程是否存活来显示状态
-- 拖入或选择的文件会上传到 `/opt/ac_ws/models/`
-- 可以读取 `/opt/ac_ws/config/robot.yaml` 中 `robot`、`run_gait`、
-  `camera_perceptied` 下的 4 个模型 `name`，修改后保存，注释会保留
-- 每个配置 name 后面有“参数”按钮，弹窗显示该配置节的原始 YAML 文本，
-  可直接整段复制替换后保存
-- 勾选“记住密码”后，密码会保存在 `~/.ssh_control.json`，该文件权限为 600
-- 连接日志和命令输出显示在下方日志区
-
-## 打包成可执行文件（可选）
+### 3. 启动程序
 
 ```bash
-cd ssh_control
-PYTHONPATH="$PWD/vendor" pyinstaller --onefile --noconsole ssh_control.py
+bash run.sh
 ```
+
+后续启动只需执行这条命令，无需重复安装依赖。
+
+## 使用说明
+
+在界面填写主机地址（默认 `192.168.44.100`）、SSH 用户名、密码或私钥，
+点击“立即检测”确认连接。远端需要已安装 SSH 服务及 `test_all.sh` 对应的
+systemd 服务；执行启停时，登录账号需要相应的 sudo 权限。
+
+- **启停服务**：分别执行 `sudo systemctl start test_all.sh` 和
+  `sudo systemctl stop test_all.sh`。
+- **状态检测**：自动刷新服务运行状态和开机自启动配置，也能识别开机已启动的
+  服务；自启动状态仅显示，不提供开关。
+- **电量显示**：读取 `/opt/ac_ws/logs/bms_driver.log` 中的 SOC。
+- **文件上传**：选择或拖入文件，上传至 `/opt/ac_ws/models/`，显示进度条；
+  上传期间不能选择或拖入其他文件。
+- **远程配置**：读取和保存 `/opt/ac_ws/config/robot.yaml` 中的模型名称，
+  点击“参数”可编辑对应配置节；名称输入框支持粘贴替换选中文字。
+
+连接设置保存在 `~/.ssh_control.json`。勾选“记住密码”后，密码会以明文保存在
+该文件中，文件权限为 `600`。操作结果和错误信息可在界面下方日志区查看。
