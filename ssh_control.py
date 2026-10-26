@@ -99,7 +99,8 @@ PROFILES = {
         "config_path": os.path.join(
             os.path.expanduser("~"), ".ssh_control_perception.json"
         ),
-        "workdir": "/home/ac/Documents/AC/work_ws",
+        "workdir": "/home/ac/Documents/ac/docking_ws",
+        # "workdir": "/home/ac/Documents/AC/work_ws",
         "panels": [
             {
                 "name": "FastDDS",
@@ -109,7 +110,8 @@ PROFILES = {
             {
                 "name": "相机节点",
                 "script": "bringup2.sh",
-                "detect_keyword": "camera_container",
+                "detect_keyword": "/camera/camera",
+                "stop_keyword": "realsense2_camera",
                 "stop_timeout": 90.0,
             },
         ],

@@ -204,7 +204,8 @@ class PerceptionApp:
                 "script": panel["script"],
                 "start_command": start_command(self.workdir, panel["script"]),
                 "stop_command": stop_command(
-                    self.workdir, panel["script"], panel.get("detect_keyword", "")
+                    self.workdir, panel["script"],
+                    panel.get("stop_keyword", panel.get("detect_keyword", "")),
                 ),
                 "detect_command": detect_command(self.workdir),
                 "detect_keyword": panel.get("detect_keyword", ""),
