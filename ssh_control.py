@@ -17,8 +17,9 @@ import threading
 import time
 import tkinter as tk
 import urllib.parse
+from dataclasses import dataclass
 from tkinter import font as tkfont
-from tkinter import filedialog, scrolledtext
+from tkinter import filedialog, scrolledtext, ttk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -42,7 +43,7 @@ APP_TITLE = "SSH 远程控制"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ssh_control.json")
 DEFAULT_HOST = "192.168.44.100"
 REMOTE_CONFIG_PATH = "/opt/ac_ws/config/robot.yaml"
-DEFAULT_PID_PATH = "/opt/ac_ws/logs/start_all.pid"
+DEFAULT_SERVICE_NAME = "test_all.sh"
 BMS_LOG_PATH = "/opt/ac_ws/logs/bms_driver.log"
 MODEL_PATH_LABELS = {
     ("robot", "first_model_config"): "robot / first",
@@ -73,8 +74,8 @@ DEFAULTS = {
     "username": "",
     "password": "",
     "key_file": "",
-    "start_command": "cd /opt/ac_ws && sudo ./robot_service.sh",
-    "stop_command": "cd /opt/ac_ws && sudo ./robot_service.sh stop",
+    "start_command": "sudo systemctl start test_all.sh",
+    "stop_command": "sudo systemctl stop test_all.sh",
     "auto_check": True,
     "check_interval": 5,
     "remember_password": False,
@@ -87,7 +88,7 @@ PROFILES = {
         "title": "SSH 远程控制 · 运控",
         "config_path": CONFIG_PATH,
         "remote_config_path": REMOTE_CONFIG_PATH,
-        "pid_path": DEFAULT_PID_PATH,
+        "service_name": DEFAULT_SERVICE_NAME,
         "bms_log_path": BMS_LOG_PATH,
         "model_labels": MODEL_PATH_LABELS,
         "show_config": True,
@@ -162,6 +163,49 @@ def parse_battery_soc(text):
     if not matches:
         return None
     return max(0, min(100, int(matches[-1])))
+
+
+@dataclass(frozen=True)
+class SystemdServiceStatus:
+    load: str
+    active: str
+    sub: str
+    unit_file: str
+
+    @property
+    def running(self):
+        if self.load not in ("loaded", "masked"):
+            return None
+        if self.active in ("active", "reloading", "refreshing"):
+            return True
+        if self.active in ("inactive", "failed"):
+            return False
+        return None
+
+    @property
+    def text(self):
+        if self.load == "not-found":
+            return "服务不存在"
+        if self.load not in ("loaded", "masked"):
+            return f"服务加载异常（{self.load}）"
+        return {
+            "active": "已启动", "inactive": "未启动", "failed": "运行失败",
+            "activating": "启动中…", "deactivating": "停止中…",
+            "reloading": "重载中…", "refreshing": "刷新中…",
+        }.get(self.active, f"未知状态（{self.active}）")
+
+    @property
+    def autostart_text(self):
+        if self.load == "not-found":
+            return "服务不存在"
+        return {
+            "enabled": "已启用", "disabled": "未启用",
+            "enabled-runtime": "临时启用（重启失效）",
+            "masked": "已屏蔽", "masked-runtime": "临时屏蔽",
+            "static": "静态单元（由依赖触发）", "indirect": "间接启用",
+            "linked": "已链接（未启用）", "linked-runtime": "临时链接（未启用）",
+            "alias": "别名单元", "generated": "动态生成", "transient": "临时单元",
+        }.get(self.unit_file, f"未知（{self.unit_file or '未返回配置'}）")
 
 
 class SshManager:
@@ -262,7 +306,7 @@ class SshManager:
             raise OSError(f"sudo 命令失败：{err.strip() or out.strip()}")
         return out
 
-    def upload(self, settings, local_path, remote_dir="/opt/ac_ws/models/"):
+    def upload(self, settings, local_path, remote_dir="/opt/ac_ws/models/", callback=None):
         with self.lock:
             if not self._connected_locked():
                 self._close_locked()
@@ -273,10 +317,18 @@ class SshManager:
             safe_dir = shlex.quote(remote_dir.rstrip("/"))
             remote_path = remote_dir.rstrip("/") + "/" + basename
             try:
+                file_size = os.path.getsize(local_path)
+
+                def put_file(target):
+                    # 权限回退可能重新传输，重置本次尝试的进度。
+                    if callback is not None:
+                        callback(0, file_size)
+                    sftp.put(local_path, target, callback=callback)
+
                 sftp = client.open_sftp()
                 try:
                     try:
-                        sftp.put(local_path, remote_path)
+                        put_file(remote_path)
                     except (PermissionError, OSError):
                         if not password:
                             raise
@@ -287,10 +339,10 @@ class SshManager:
                             password,
                         )
                         try:
-                            sftp.put(local_path, remote_path)
+                            put_file(remote_path)
                         except (PermissionError, OSError):
                             temp_path = "/tmp/" + basename
-                            sftp.put(local_path, temp_path)
+                            put_file(temp_path)
                             self._sudo_exec(
                                 client,
                                 f"mv {shlex.quote(temp_path)} {shlex.quote(remote_path)}",
@@ -356,29 +408,21 @@ class SshManager:
                     password,
                 )
 
-    def check_service_status(self, settings, pid_path):
+    def check_service_status(self, settings, service_name):
+        # show 提供稳定的键值输出；不依赖 PID 文件，也不混淆运行与自启动。
         command = (
-            "if [ -f " + shlex.quote(pid_path) + " ]; then "
-            "while read pid; do "
-            "[ -n \"$pid\" ] && ps -p \"$pid\" >/dev/null 2>&1 "
-            "&& echo RUNNING && exit 0; "
-            "done < " + shlex.quote(pid_path) + "; "
-            "fi; echo STOPPED"
+            "systemctl show --no-pager --all "
+            "--property=LoadState,ActiveState,SubState,UnitFileState -- "
+            + shlex.quote(service_name)
         )
-        with self.lock:
-            if not self._connected_locked():
-                self._close_locked()
-                self.client = self._new_client(settings)
-            client = self.client
-            wrapped = "sh -c " + shlex.quote(command)
-            stdin, stdout, stderr = client.exec_command(wrapped, timeout=15)
-            stdout.channel.settimeout(15)
-            out = stdout.read().decode("utf-8", "replace")
-            err = stderr.read().decode("utf-8", "replace")
-            code = stdout.channel.recv_exit_status()
-            if code != 0:
-                raise OSError(f"状态检测失败：{err.strip() or out.strip()}")
-        return "RUNNING" in out, pid_path
+        code, out, err = self.run(settings, command, timeout=15)
+        values = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if code != 0 or not all(values.get(key) for key in ("LoadState", "ActiveState", "SubState")):
+            raise OSError(f"状态检测失败：{err.strip() or out.strip() or 'systemd 未返回服务状态'}")
+        return SystemdServiceStatus(
+            values["LoadState"], values["ActiveState"], values["SubState"],
+            values.get("UnitFileState", ""),
+        )
 
     def read_battery_soc(self, settings, log_path, timeout=15):
         """读取远端电量日志末尾，返回日志文本，找不到 SOC 由调用方处理。"""
@@ -747,7 +791,7 @@ class SshControlApp:
         self.remote_config_path = self.profile.get(
             "remote_config_path", REMOTE_CONFIG_PATH
         )
-        self.pid_path = self.profile.get("pid_path", DEFAULT_PID_PATH)
+        self.service_name = self.profile.get("service_name", DEFAULT_SERVICE_NAME)
         self.bms_log_path = self.profile.get("bms_log_path", "")
         self.model_labels = self.profile.get("model_labels", MODEL_PATH_LABELS)
         self.show_config = self.profile.get("show_config", True)
@@ -755,8 +799,10 @@ class SshControlApp:
         self.manager = SshManager()
         self.checking = False
         self.command_busy = False
+        self.uploading = False
         self.show_password = False
         self.service_running = None
+        self.service_status = None
         self.param_windows = {}
         self.check_stop = threading.Event()
         self.message_queue = queue.Queue()
@@ -836,11 +882,14 @@ class SshControlApp:
         self.auto_check_var = tk.BooleanVar()
         self.remember_var = tk.BooleanVar()
         self.upload_var = tk.StringVar(value="拖入文件到此处")
+        self.upload_percent_var = tk.DoubleVar(value=0)
+        self.upload_progress_var = tk.StringVar(value="等待上传")
         self.model_vars = {
             path: tk.StringVar() for path in RobotYaml.PATHS
         }
         self.param_buttons = {}
         self.service_status_var = tk.StringVar(value="未检测")
+        self.autostart_status_var = tk.StringVar(value="未检测")
         self.status_var = tk.StringVar(value="等待配置")
         self.last_check_var = tk.StringVar(value="")
         self.battery_soc_var = tk.StringVar(value="未知")
@@ -859,12 +908,10 @@ class SshControlApp:
         self.username_var.set(str(cfg.get("username", "")))
         self.password_var.set(str(cfg.get("password", "")) if cfg.get("remember_password") else "")
         self.key_file_var.set(str(cfg.get("key_file", "")))
-        self.start_cmd_var.set(
-            str(cfg.get("start_command") or self.profile["defaults"]["start_command"])
-        )
-        self.stop_cmd_var.set(
-            str(cfg.get("stop_command") or self.profile["defaults"]["stop_command"])
-        )
+        # 运控的检测目标固定为 systemd 服务，旧配置不得恢复为脚本启停。
+        commands = self.profile["defaults"] if "service_name" in self.profile else cfg
+        self.start_cmd_var.set(str(commands.get("start_command") or DEFAULTS["start_command"]))
+        self.stop_cmd_var.set(str(commands.get("stop_command") or DEFAULTS["stop_command"]))
         self.interval_var.set(str(cfg.get("check_interval", 5)))
         self.auto_check_var.set(bool(cfg.get("auto_check", True)))
         self.remember_var.set(bool(cfg.get("remember_password", False)))
@@ -1070,6 +1117,8 @@ class SshControlApp:
         )
         self.status_check_button.pack(side="right")
 
+        self._build_autostart_row(inner)
+
         buttons = tk.Frame(inner, bg=COLORS["panel"])
         buttons.pack(fill="x", pady=(8, 0))
         self.start_button = tk.Button(
@@ -1104,7 +1153,8 @@ class SshControlApp:
         grid.columnconfigure(1, weight=1)
         for row, path in enumerate(RobotYaml.PATHS):
             self._grid_label(grid, self.model_labels[path], row, 0)
-            self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
+            entry = self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
+            entry.bind("<<Paste>>", self._paste_config_entry)
             self.param_buttons[path] = tk.Button(
                 grid, text="参数", command=lambda p=path: self._open_params(p),
                 bg=COLORS["panel2"], fg=COLORS["fg"],
@@ -1226,6 +1276,8 @@ class SshControlApp:
         )
         self.status_check_button.pack(side="right")
 
+        self._build_autostart_row(inner)
+
         if self.bms_log_path:
             battery_row = tk.Frame(inner, bg=COLORS["panel"])
             battery_row.pack(fill="x", pady=(8, 0))
@@ -1261,6 +1313,19 @@ class SshControlApp:
                 font=(self.font_family, 9),
             ).pack(side="right")
 
+    def _build_autostart_row(self, parent):
+        row = tk.Frame(parent, bg=COLORS["panel"])
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            row, text="开机自启动:", bg=COLORS["panel"], fg=COLORS["muted"],
+            font=(self.font_family, 10),
+        ).pack(side="left")
+        self.autostart_status_label = tk.Label(
+            row, textvariable=self.autostart_status_var, bg=COLORS["panel"],
+            fg=COLORS["muted"], font=(self.font_family, 10, "bold"),
+        )
+        self.autostart_status_label.pack(side="left", padx=(6, 0))
+
     def _build_upload_card(self, main):
         card = tk.Frame(
             main, bg=COLORS["panel"], highlightbackground=COLORS["border"],
@@ -1289,11 +1354,12 @@ class SshControlApp:
             drop, textvariable=self.upload_var, bg=COLORS["panel2"],
             fg=COLORS["muted"], anchor="w", font=(self.font_family, 10),
         ).grid(row=0, column=0, sticky="ew")
-        tk.Button(
+        self.choose_file_button = tk.Button(
             drop, text="选择文件", command=self._choose_file,
             bg=COLORS["panel2"], fg=COLORS["fg"], activebackground=COLORS["border"],
             activeforeground=COLORS["fg"], relief="flat", padx=10, pady=3,
-        ).grid(row=0, column=1, padx=(10, 0))
+        )
+        self.choose_file_button.grid(row=0, column=1, padx=(10, 0))
         self.upload_button = tk.Button(
             drop, text="上传", command=self._upload_file,
             bg=COLORS["accent_dim"], fg="#06120b", activebackground=COLORS["accent"],
@@ -1301,6 +1367,16 @@ class SshControlApp:
             relief="flat", padx=14, pady=3, font=(self.font_family, 10, "bold"),
         )
         self.upload_button.grid(row=0, column=2, padx=(10, 0))
+
+        self.upload_progress_bar = ttk.Progressbar(
+            inner, variable=self.upload_percent_var, maximum=100,
+            mode="determinate",
+        )
+        self.upload_progress_bar.pack(fill="x", pady=(12, 0))
+        tk.Label(
+            inner, textvariable=self.upload_progress_var, bg=COLORS["panel"],
+            fg=COLORS["muted"], anchor="w", font=(self.font_family, 9),
+        ).pack(fill="x", pady=(4, 0))
 
         if HAS_TKDND:
             card.drop_target_register(DND_FILES)
@@ -1335,7 +1411,8 @@ class SshControlApp:
         grid.columnconfigure(1, weight=1)
         for row, path in enumerate(RobotYaml.PATHS):
             self._grid_label(grid, self.model_labels[path], row, 0)
-            self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
+            entry = self._grid_entry(grid, self.model_vars[path], row, 1, padx=(4, 0))
+            entry.bind("<<Paste>>", self._paste_config_entry)
             self.param_buttons[path] = tk.Button(
                 grid, text="参数", command=lambda p=path: self._open_params(p),
                 bg=COLORS["panel2"], fg=COLORS["fg"],
@@ -1362,7 +1439,28 @@ class SshControlApp:
         )
         self.config_save_button.pack(side="right", padx=(10, 0))
 
+    def _paste_config_entry(self, event):
+        entry = event.widget
+        if str(entry.cget("state")) != "normal":
+            return "break"
+        try:
+            text = entry.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if entry.selection_present():
+            start = entry.index("sel.first")
+            entry.delete("sel.first", "sel.last")
+            entry.icursor(start)
+        entry.insert("insert", text)
+        return "break"
+
     def _on_file_drop(self, event):
+        if self.command_busy:
+            self._append_log(
+                "正在上传，请稍候；上传期间不能拖入其他文件" if self.uploading
+                else "正在执行其他操作，请稍后再拖入文件", "muted",
+            )
+            return "refuse_drop"
         files = self._parse_drop_files(event.data)
         if files:
             self._upload_file(files[0])
@@ -1403,6 +1501,9 @@ class SshControlApp:
         walk(self.root)
 
     def _choose_file(self):
+        if self.command_busy:
+            self._append_log("正在执行操作，请稍后再选择文件", "muted")
+            return
         path = filedialog.askopenfilename(title="选择要上传的文件")
         if path:
             self.upload_var.set(path)
@@ -1410,6 +1511,7 @@ class SshControlApp:
 
     def _upload_file(self, local_path=None):
         if self.command_busy:
+            self._append_log("正在执行操作，请稍后再上传文件", "muted")
             return
         path = local_path or self.upload_var.get().strip()
         if not path or path == "拖入文件到此处":
@@ -1424,6 +1526,9 @@ class SshControlApp:
         except ValueError as exc:
             self._set_status("bad", "配置无效", str(exc))
             return
+        self.uploading = True
+        self.upload_percent_var.set(0)
+        self.upload_progress_var.set("准备上传… 上传期间不能拖入或选择其他文件")
         self._set_command_busy(True)
         threading.Thread(
             target=self._upload_worker, args=(settings, path), daemon=True
@@ -1433,8 +1538,18 @@ class SshControlApp:
         name = os.path.basename(local_path)
         remote_path = "/opt/ac_ws/models/" + name
         self._post_log(f"正在上传 {name} 到 /opt/ac_ws/models/", "muted")
+        success = False
+        last_update = 0.0
+
+        def progress(sent, total):
+            nonlocal last_update
+            now = time.monotonic()
+            if sent == 0 or sent >= total or now - last_update >= 0.1:
+                self.message_queue.put(("upload_progress", sent, total))
+                last_update = now
+
         try:
-            self.manager.upload(settings, local_path)
+            self.manager.upload(settings, local_path, callback=progress)
         except paramiko.AuthenticationException:
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
             self._post_log("上传失败：认证失败", "bad")
@@ -1446,9 +1561,11 @@ class SshControlApp:
             self._post_status("bad", "配置无效", str(exc))
             self._post_log(f"上传失败：{exc}", "bad")
         else:
+            success = True
             self._post_status("ok", "已连接", "文件上传完成")
             self._post_log(f"上传完成：{remote_path}", "ok")
         finally:
+            self.message_queue.put(("upload_done", success))
             self.message_queue.put(("busy", False))
 
     def _read_config(self):
@@ -1747,18 +1864,21 @@ class SshControlApp:
         self._post_log("正在检测运行状态...", "muted")
         try:
             try:
-                running, pid_path = self.manager.check_service_status(
-                    settings, self.pid_path
+                status = self.manager.check_service_status(
+                    settings, self.service_name
                 )
-                self.message_queue.put(("service_status", running, pid_path))
+                self.message_queue.put(("service_status", status, False))
             except paramiko.AuthenticationException:
+                self.message_queue.put(("service_status_error", "认证失败"))
                 self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
                 self._post_log("状态检测失败：认证失败", "bad")
             except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
                 message = str(exc).strip() or type(exc).__name__
+                self.message_queue.put(("service_status_error", message))
                 self._post_status("bad", "无法连接", message)
                 self._post_log(f"状态检测失败：{message}", "bad")
             except ValueError as exc:
+                self.message_queue.put(("service_status_error", str(exc)))
                 self._post_log(f"状态检测失败：{exc}", "bad")
             if self.bms_log_path:
                 soc, detail, raw = self._read_battery(settings)
@@ -1957,11 +2077,14 @@ class SshControlApp:
             self._post_status("ok", "已连接", f"耗时 {elapsed:.2f}s")
             self._refresh_runtime(settings)
         except paramiko.AuthenticationException:
+            self.message_queue.put(("service_status_error", "认证失败"))
             self._post_status("bad", "无法连接", "认证失败，请检查用户名、密码或私钥")
         except (socket.timeout, socket.gaierror, paramiko.SSHException, OSError) as exc:
             message = str(exc).strip() or type(exc).__name__
+            self.message_queue.put(("service_status_error", message))
             self._post_status("bad", "无法连接", message)
         except ValueError as exc:
+            self.message_queue.put(("service_status_error", str(exc)))
             self._post_status("bad", "配置无效", str(exc))
         finally:
             self.checking = False
@@ -1969,13 +2092,13 @@ class SshControlApp:
     def _refresh_runtime(self, settings):
         """自动检测时同步刷新运行状态与电量，单项失败不影响其他项。"""
         try:
-            running, pid_path = self.manager.check_service_status(
-                settings, self.pid_path
+            status = self.manager.check_service_status(
+                settings, self.service_name
             )
-            self.message_queue.put(("service_status", running, pid_path, True))
+            self.message_queue.put(("service_status", status, True))
         except (paramiko.AuthenticationException, socket.timeout,
-                socket.gaierror, paramiko.SSHException, OSError, ValueError):
-            pass
+                socket.gaierror, paramiko.SSHException, OSError, ValueError) as exc:
+            self.message_queue.put(("service_status_error", str(exc) or type(exc).__name__))
         if not self.bms_log_path:
             return
         soc, detail, raw = self._read_battery(settings)
@@ -2042,6 +2165,7 @@ class SshControlApp:
         for name in (
             "detect_button",
             "upload_button",
+            "choose_file_button",
             "config_read_button",
             "config_save_button",
             "status_check_button",
@@ -2077,6 +2201,20 @@ class SshControlApp:
                     self._append_log(*payload)
                 elif kind == "busy":
                     self._set_command_busy(payload[0])
+                elif kind == "upload_progress":
+                    sent, total = payload
+                    percent = min(99, int(sent * 100 / total)) if total > 0 else 0
+                    self.upload_percent_var.set(percent)
+                    detail = f"{sent / 1048576:.2f} / {total / 1048576:.2f} MB"
+                    stage = "传输完成，正在确认远端文件…" if sent >= total else f"上传中 {percent}%"
+                    self.upload_progress_var.set(f"{stage}（{detail}）")
+                elif kind == "upload_done":
+                    self.uploading = False
+                    if payload[0]:
+                        self.upload_percent_var.set(100)
+                        self.upload_progress_var.set("上传完成 100%")
+                    else:
+                        self.upload_progress_var.set("上传失败，请查看日志后重试")
                 elif kind == "config":
                     names = payload[0]
                     for path in RobotYaml.PATHS:
@@ -2084,23 +2222,40 @@ class SshControlApp:
                             names.get(".".join(path)) or ""
                         )
                 elif kind == "service_status":
-                    running, pid_path = payload[0], payload[1]
-                    quiet = payload[2] if len(payload) > 2 else False
-                    changed = (
-                        self.service_running is None
-                        or self.service_running != running
-                    )
-                    self.service_running = running
-                    self.service_status_var.set("已启动" if running else "未启动")
+                    status, quiet = payload
+                    changed = self.service_status != status
+                    self.service_status = status
+                    self.service_running = status.running
+                    self.service_status_var.set(status.text)
                     self.service_status_label.configure(
-                        fg=COLORS["accent"] if running else COLORS["muted"]
+                        fg=COLORS["danger"] if status.active == "failed" or status.load != "loaded"
+                        else COLORS["warn"] if status.running is None
+                        else COLORS["accent"] if status.running else COLORS["muted"]
+                    )
+                    self.autostart_status_var.set(status.autostart_text)
+                    self.autostart_status_label.configure(
+                        fg=COLORS["accent"] if status.unit_file == "enabled"
+                        else COLORS["muted"] if status.unit_file == "disabled"
+                        else COLORS["warn"]
                     )
                     self._update_command_buttons()
                     if (quiet and changed) or not quiet:
                         self._append_log(
-                            f"运行状态：{'已启动' if running else '未启动'}（{pid_path}）",
-                            "ok" if running else "muted",
+                            f"运行状态：{status.text}（{status.active}/{status.sub}）；"
+                            f"开机自启动：{status.autostart_text}",
+                            "ok" if status.running else "muted",
                         )
+                elif kind == "service_status_error":
+                    changed = self.service_status_var.get() != "检测失败"
+                    self.service_status = None
+                    self.service_running = None
+                    self.service_status_var.set("检测失败")
+                    self.autostart_status_var.set("未知（检测失败）")
+                    self.service_status_label.configure(fg=COLORS["warn"])
+                    self.autostart_status_label.configure(fg=COLORS["warn"])
+                    self._update_command_buttons()
+                    if changed:
+                        self._append_log(f"服务状态检测失败：{payload[0]}", "bad")
                 elif kind == "battery":
                     self._set_battery(*payload)
                 elif kind == "status_refresh":
